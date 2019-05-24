@@ -1,0 +1,2082 @@
+drop proc dw.usp_LidMastering_MasteringEngine
+Create proc dw.usp_LidMastering_MasteringEngine
+(
+	@Request_Type Varchar(10)
+	,@Project_name varchar(250)--='Aetna|Commercial 2017|MRR|03171048'
+	,@Vc_Remarks varchar(100) out
+	,@I_Lid_Count int out
+	,@Vc_Error_Desc Varchar(2000)='' out
+)
+as
+Begin
+
+		Begin Try
+		
+				------------Check Project Existing or Not------------------------------
+				if exists (select 1 from dw.Tb_LidMastering_Projectwise where Project_name=@Project_name) and @Request_Type='Add'
+				begin
+					set @Vc_Remarks='Project already Mastered'
+					Return
+				end
+				---------------------Create Table Object-----------------------------------
+				if object_id('tempdb..#temp_provider_loc_reference') is not null drop table #temp_provider_loc_reference
+
+				Create table #temp_provider_loc_reference
+				(
+					provider__c varchar(250),location__c varchar(250),plj_record_date datetime
+				)
+				create index ix_nc on #temp_provider_loc_reference(location__c,provider__c)
+				include(plj_record_date)
+
+				---------From PL-Jn, prepare to remove LID duplicates at location, provider level-----------------
+				insert into #temp_provider_loc_reference
+				(
+					provider__c,location__c,plj_record_date
+				)
+				 select	ProviderLocationJunction__c.provider__c
+						,ProviderLocationJunction__c.location__c
+						,max(ProviderLocationJunction__c.LastModifiedDate) as plj_record_date
+				   from	ProviderLocationJunction__c    
+				  where	ProviderLocationJunction__c.project_name__c=@Project_name--'Aetna|Medicare 2018|MRR|03180404'
+			   group by	ProviderLocationJunction__c.provider__c
+						,ProviderLocationJunction__c.location__c
+
+				--------------------Check Request Type-----------------------------------------------
+				--if @Request_Type='Delete'
+				--Begin
+				
+				--		goto Delete_Block
+				--End
+		
+				if ((select count(1) from #temp_provider_loc_reference)=0)
+				Begin
+						select @I_Lid_Count=0,@Vc_Remarks='No Records'
+						Return
+				
+				End
+
+				---------PROVIDER TIN ADD PH COMBINATION - CHART COUNTS + RETREIVAL TYPES CALCULATION------------------
+				if object_id('tempdb..#temp_rel_qap_data') is not null drop table #temp_rel_qap_data 
+
+				  ;with	rel_qap_data 
+					 as	(  
+							 select	provider_loc_reference.Location__c
+									,provider_loc_reference.Provider__c
+									,provider_loc_reference.plj_record_date 
+									,Chart__c.id chart_id
+                   
+									--Provider Contact Data Set
+									,provider__c.NPI__c          
+									,provider__c.TIN_ID__c
+									,provider__c.Provider_Full_Address__c
+									,provider__c.Provider_Full_Address_With_Suite__c
+									,Replace(provider__c.Address_Line_1__c,'@',' ') Address_Line
+									,provider__c.Address_Line_2__c Address_Line_Suite
+									,case when Address_Line_1__c is null then '' else Replace(provider__c.Address_Line_1__c,'@',' ') + ' ' end + isnull(Address_Line_2__c,'') as Address_With_Suite
+									,provider__c.City__c
+									,provider__c.State__c
+									,left(ltrim(provider__c.ZIP_Code__c ),5) as ZIP_Code__c 
+									,case when Replace(provider__c.Address_Line_1__c,'@',' ') is null then '' else provider__c.Address_Line_1__c + ' ' end 
+									+case when provider__c.Address_Line_2__c is null then '' else provider__c.Address_Line_2__c + ' ' end                              
+									+case when provider__c.City__c is null           then '' else provider__c.City__c + ' ' end
+									+case when provider__c.State__c is null          then '' else provider__c.State__c + ' ' end
+									+case when provider__c.ZIP_Code__c is null       then '' else left(ltrim(provider__c.ZIP_Code__c ),5) + ' ' end
+									as full_address
+							 
+									,dbo.fn_cleanse_phone(isnull(provider__c.Phone_Number__c,Secondary_Phone_Number__c)) Phone_Number_Select
+									,dbo.fn_cleanse_phone(provider__c.Phone_Number__c) Phone_Number_1
+									,dbo.fn_cleanse_phone(provider__c.Secondary_Phone_Number__c) Phone_Number_2    
+									,dbo.fn_cleanse_phone(provider__c.Fax_Number__c) Fax_Number__c
+									--Provider Location Data Control Field generation
+									,row_number() 
+										over(partition by	provider_loc_reference.location__c
+												order by	plj_record_date) as rownum_remove_location_repeatition_forMasterProcessing
+									,row_number() 
+										over(partition by	provider_loc_reference.location__c
+															,provider_loc_reference.Provider__c
+												order by	Chart__c.LastModifiedDate desc) as rownum_remove_chartLvl_reptions_for_cl_processing --sorting by chart dates, actually not required when we are intrested in removing chart info and go to location,provider level
+									,count(Chart__c.id) 
+										over(partition by	provider_loc_reference.location__c)as charts_at_loc
+
+									---Charts Retried at location by various compbinations of the key fields npi tin address and phone
+									---Charts retreival numbers by type of retreival 
+									,Chart__c.MRT_Name__c
+									,case 
+										   when	charindex('FTP',Chart__c.MRT_Name__c) > 0 then 'SFTP'
+										   when	charindex('Mail Room',Chart__c.MRT_Name__c) > 0  or	charindex('MailRoom',Chart__c.MRT_Name__c) > 0 then 'Mail Room' 
+										   when	charindex('Ringcentral',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Ring central',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Vitelity',Chart__c.MRT_Name__c) > 0 then 'Fax' 
+										   when	charindex('EMail',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('email',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('E Mail',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('E-Mail',Chart__c.MRT_Name__c) > 0 then 'E-Mail' 
+										  when (charindex('Ciox',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Diversified',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Diversified Medical Records Services',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('DMRS',Chart__c.MRT_Name__c) > 0 
+											 or	Chart__c.MRT_Name__c = 'BOX' 
+											 or	charindex('Chartswap',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Chart swap',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Sharecare',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Share care',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('MRO',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('DataFile',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Data File',Chart__c.MRT_Name__c) > 0  
+											 or	charindex('Scanstat',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Scan stat',Chart__c.MRT_Name__c) > 0  
+											 or	charindex('Health',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Integrity Document Solutions',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('IDS',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('BACTES',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('IOD',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('STAT Imaging',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Imaging',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Chart',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Photostat',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Photo stat',Chart__c.MRT_Name__c) > 0  
+											 or	charindex('Midwest ROI',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Verisma',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Dynamic Document Imaging',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('DDI',Chart__c.MRT_Name__c) > 0 
+											 or	charindex('Medical Records',Chart__c.MRT_Name__c) > 0) 
+										   then	'CopyService'                                                                                    
+										   when	Chart__c.MRT_Name__c is null then 'NullsOthers'
+										   else	'Field'
+									end Retreival_type 
+							   from	#temp_provider_loc_reference as provider_loc_reference
+							   join	Chart__c 
+								 on	provider_loc_reference.Location__c     = Chart__c.Location__c
+								and	provider_loc_reference.Provider__c = Chart__c.Provider__c
+							   join	Provider__c
+								 on	Chart__c.Provider__c = Provider__c.id
+							  where	Chart__c.FileBound_Disposition_Code__c = 'QAP'
+								and	Chart__c.FileBound_Status__c = 'REL'  
+								and	isnull(Chart__c.MRT_Name__c,'') <> 'Replication'
+				)
+				 select	rel_qap_data.*  
+						,case when Retreival_type = 'SFTP'        then 1 else 0 end as location_charts_count_retreived_via_SFTP
+						,case when Retreival_type = 'Mail Room'   then 1 else 0 end as location_charts_count_retreived_via_MailRoom
+						,case when Retreival_type = 'Fax'         then 1 else 0 end as location_charts_count_retreived_via_Fax
+						,case when Retreival_type = 'E-Mail'      then 1 else 0 end as location_charts_count_retreived_via_eMail
+						,case when Retreival_type = 'CopyService' then 1 else 0 end as location_charts_count_retreived_via_CopyService
+						,case when Retreival_type = 'Field'       then 1 else 0 end as location_charts_count_retreived_via_Field
+						,case when Retreival_type = 'NullsOthers' then 1 else 0 end as location_charts_count_retreived_via_NullOthers
+				   into	#temp_rel_qap_data 
+				   from	rel_qap_data
+
+				/**********************************Update Phone1 is null Records********************************************/
+		
+				if object_id('tempdb..#temp_RelQap_Data') is not null drop table #temp_RelQap_Data
+
+				;with retreival_types as
+				(            
+					 select	location__c
+							,charts_at_loc
+							,sum(location_charts_count_retreived_via_SFTP          ) as charts_retreived_via_SFTP
+							,sum(location_charts_count_retreived_via_MailRoom      ) as charts_retreived_via_MailRoom
+							,sum(location_charts_count_retreived_via_Fax           ) as charts_retreived_via_Fax
+							,sum(location_charts_count_retreived_via_eMail         ) as charts_retreived_via_eMail
+							,sum(location_charts_count_retreived_via_CopyService   ) as charts_retreived_via_CopyService
+							,sum(location_charts_count_retreived_via_Field         ) as charts_retreived_via_Field
+							,sum(location_charts_count_retreived_via_NullOthers    ) as charts_retreived_via_NullOthers
+					   from	#temp_rel_qap_data
+				   group by	location__c
+							,charts_at_loc
+				)
+
+				select	location2__c.id as location__c
+						,rel_qap_data.Provider__c
+						,rel_qap_data.chart_id
+						,rel_qap_data.TIN_ID__c
+						,Location2__c.name as sfdc_Lid
+						,Replace(Location2__c.Address_Line_1__c,'@',' ')Address_Line_1__c
+						,Location2__c.Address_Line_2__c
+						,dbo.fn_cleanse_phone(Location2__c.Phone_1__c) as Phone_1__c
+						,dbo.fn_cleanse_phone(Location2__c.Phone_2__c) as Phone_2__c
+						,Location2__c.Practice_Name__c
+						,Location2__c.State__c
+						,left(ltrim(Location2__c.ZIP_Code__c ),5) as ZIP_Code__c
+						,Location2__c.City__c
+						,isnull(Replace(Location2__c.Address_Line_1__c,'@',' '),'')+isnull(Location2__c.Address_Line_2__c,'')+isnull(Location2__c.State__c,'')+isnull(left(ltrim(Location2__c.ZIP_Code__c ),5),'')+isnull(Location2__c.City__c,'') as Complete_Address
+						,rel_qap_data.full_address as Provider_Full_Address
+						,rel_qap_data.Address_Line as Provider_Address_1
+						,rel_qap_data.Address_Line_Suite as Provider_Address_2
+						,rel_qap_data.City__c as Provider_City
+						,rel_qap_data.State__c as Provider_State
+						,rel_qap_data.ZIP_Code__c as Provider_ZIP_Code
+						,coalesce(dbo.fn_cleanse_phone(Location2__c.Fax_Number__c),dbo.fn_cleanse_phone(Location2__c.Fax_Number_Console__c),dbo.fn_cleanse_phone(Location2__c.Fax_Number_For_Display__c)) as Col_Fax_Number__c
+						,dbo.fn_cleanse_phone(Location2__c.Fax_Number__c) as Fax_Number__c
+						,dbo.fn_cleanse_phone(Location2__c.Fax_Number_Console__c) as Fax_Number_Console__c
+						,dbo.fn_cleanse_phone(Location2__c.Fax_Number_For_Display__c) as Fax_Number_For_Display__c
+						,retreival_types.Charts_retreived_via_SFTP
+						,retreival_types.Charts_retreived_via_MailRoom 
+						,retreival_types.Charts_retreived_via_Fax 
+						,retreival_types.Charts_retreived_via_eMail 
+						,retreival_types.Charts_retreived_via_CopyService 
+						,retreival_types.Charts_retreived_via_Field 
+						,retreival_types.Charts_retreived_via_NullOthers
+						,retreival_types.charts_at_loc
+						,Location2__c.CreatedDate
+						,Location2__c.LastModifiedDate   
+						,Location2__c.Num_of_Charts__c - Num_of_charts_URC__c as Num_of_Charts__c
+						,Location2__c.Num_of_Charts_Scheduled__c     
+						,Location2__c.Client_Name__c
+						,Location2__c.Contact_Person__c
+						,Location2__c.Contact_Person_2__c
+						,Location2__c.Location__Latitude__s
+						,Location2__c.Location__Longitude__s
+						,Location2__c.Record_Storage_Type__c
+						,Location2__c.EMR_System__c
+						,Location2__c.EMR_Version__c
+						,Location2__c.Other_EMR_System__c
+						,Location2__c.Appointment_Type__c
+						,Location2__c.Workflow_Status__c
+						,Location2__c.Invoices__c
+						,Location2__c.PNP_Reason__c 
+						--,Location2__c.Num_of_Calls__c
+						,Location2__c.Number_of_PNP__c
+						,Task.Num_of_Calls__c
+				   into	#temp_RelQap_Data
+				   from	#temp_rel_qap_data rel_qap_data --stg.lidPrep_pljCharts_RelQap_AetnaComm2017 
+			 inner join	Location2__c
+					 on	rel_qap_data.location__c = location2__c.id
+					and rownum_remove_location_repeatition_forMasterProcessing=1
+			 inner join retreival_types as retreival_types --stg.lidPrep_ChartsAtLid_byRetType_AetnaComm2017 
+					 on rel_qap_data.location__c = retreival_types.location__c
+			  left join	(
+							 select	whatid
+									,Avg(Num_of_Calls__c) as Num_of_Calls__c 
+							   from	Task 
+						   group by	whatid
+						)as Task
+					 on	Location2__c.id=Task.whatid
+				  where	
+					not
+						(
+							(
+									Location2__c.Address_Line_1__c is null 
+								and isnull(Location2__c.phone_1__c,Location2__c.phone_2__c) is null 
+								and	coalesce(Location2__c.Fax_Number__c,Location2__c.Fax_Number_Console__c,Location2__c.Fax_Number_For_Display__c) is null
+							) 
+							and 
+							(
+								Location2__c.Practice_Name__c is null or Location2__c.ZIP_Code__c is null
+							)
+						)
+
+						--alter table #temp_RelQap_Data
+						--add Remarks varchar(250)
+
+						-----------------All Location Address for Project wise---------------------------------------------
+						if object_id('tempdb.. #Temp_Location_Address_Project_wise') is not null drop table  #Temp_Location_Address_Project_wise
+
+						 select	Location2__c.Address_Line_1__c
+								,Location2__c.Address_Line_2__c
+								,Location2__c.City__c
+								,Location2__c.State__c
+								,Location2__c.ZIP_Code__c
+								,Location2__c.Phone_1__c
+								,Location2__c.Phone_2__c
+								,Location2__c.Practice_Name__c
+								,Coalesce(Location2__c.Fax_Number__c,Location2__c.Fax_Number_Console__c,Location2__c.Fax_Number_For_Display__c) as Fax_Number__c
+								,Location2__c.CreatedDate
+								,Location2__c.LastModifiedDate
+						   into #Temp_Location_Address_Project_wise
+						   from	Location2__c 
+					 inner join	dw.Tb_LidMastering_InvocationControl
+							 on	Location2__c.Practice_Name__c=dw.Tb_LidMastering_InvocationControl.Vc_Project_name
+
+				/**********************************Update Address1 is null Records********************************************/
+				------------------Update Address1 using Google Practice Name and Zip Code--------------------
+					 update	tgt 
+						set Address_Line_1__c=bse.Address1
+							,Address_Line_2__c=bse.Address2
+							,State__c=bse.State
+							,ZIP_Code__c=bse.Zip
+							,City__c=bse.City
+					   from	#temp_RelQap_Data tgt
+				 inner join	
+							(
+								 select	* 
+								   from 
+										(
+											 select	PracticeName
+													,Address1
+													,Address2
+													,City
+													,State
+													,Zip
+													,ROW_NUMBER() over(Partition by PracticeName,Zip order by PracticeName) as R_no
+											   from	dw.Info_Google_Address bse
+										)a
+								  where	R_no=1
+
+							)bse
+						 on	tgt.Practice_Name__c=bse.PracticeName 
+						and tgt.ZIP_Code__c=bse.Zip
+					  where	tgt.Address_Line_1__c  is null
+
+				------------------Update Address1 using Google Practice Name and Zip Code--------------------
+					 update	tgt 
+						set	Address_Line_1__c=bse.Address_Line_1__c
+							,Address_Line_2__c=bse.Address_Line_2__c
+							,State__c=bse.State__c
+							,ZIP_Code__c=bse.ZIP_Code__c
+							,City__c=bse.City__c
+					   from	#temp_RelQap_Data tgt
+				 inner join	(
+								 select *
+								   from
+										(
+											 select	Address_Line_1__c
+													,Address_Line_2__c
+													,State__c
+													,ZIP_Code__c
+													,City__c
+													,Phone_1__c
+													,Phone_2__c
+													,Fax_Number__c
+													,Practice_Name__c
+													,row_number() over(Partition by Practice_Name__c,ZIP_Code__c order by bse.LastmodifiedDate desc,bse.CreatedDate desc,Complete_Address) as R_no
+											   from	#Temp_Location_Address_Project_wise bse
+											  where	Practice_Name__c is not null 
+												and ZIP_Code__c is not null
+												and bse.Address_Line_1__c is not null
+										)a
+								where R_no=1
+							)bse
+						 on	tgt.Practice_Name__c=bse.Practice_Name__c 
+						and tgt.ZIP_Code__c=bse.ZIP_Code__c
+					  where	tgt.Address_Line_1__c  is null
+
+				------------------Update Address1 using Phone1--------------------
+
+					update	tgt 
+						set	Address_Line_1__c=bse.Address_Line_1__c
+							,Address_Line_2__c=bse.Address_Line_2__c
+							,State__c=bse.State__c
+							,ZIP_Code__c=bse.ZIP_Code__c
+							,City__c=bse.City__c
+							,Phone_2__c=bse.Phone_2__c
+							,Col_Fax_Number__c=bse.Fax_Number__c
+					   from	#temp_RelQap_Data tgt
+				 inner join	
+							(
+								 select *
+								   from
+										(
+											 select	Address_Line_1__c
+													,Address_Line_2__c
+													,State__c
+													,ZIP_Code__c
+													,City__c
+													,Phone_1__c
+													,Phone_2__c
+													,Fax_Number__c
+													,row_number() over(Partition by isnull(bse.Phone_1__c,bse.Phone_2__c) order by bse.LastmodifiedDate ,bse.CreatedDate desc,bse.Complete_Address) as R_no
+											   from	#Temp_Location_Address_Project_wise bse
+											   where bse.Address_Line_1__c is not null
+										)a
+								where R_no=1
+							)bse
+						 on	isnull(tgt.Phone_1__c,tgt.Phone_2__c)=isnull(bse.Phone_1__c,bse.Phone_2__c)
+					  where	tgt.Address_Line_1__c  is null
+
+				------------------Update Address1 using Fax Number--------------------
+					 update	tgt 
+						set	Address_Line_1__c=bse.Address_Line_1__c
+							,Address_Line_2__c=bse.Address_Line_2__c
+							,State__c=bse.State__c
+							,ZIP_Code__c=bse.ZIP_Code__c
+							,City__c=bse.City__c
+							,Phone_2__c=bse.Phone_2__c
+							,Col_Fax_Number__c=bse.Fax_Number__c
+					   from	#temp_RelQap_Data tgt
+				 inner join	(
+								 select *
+								   from
+										(
+											 select	Address_Line_1__c
+													,Address_Line_2__c
+													,State__c
+													,ZIP_Code__c
+													,City__c
+													,Phone_1__c
+													,Phone_2__c
+													,Fax_Number__c
+													,row_number() over(Partition by Fax_Number__c order by bse.LastmodifiedDate ,bse.CreatedDate desc,Complete_Address) as R_no
+											   from	#Temp_Location_Address_Project_wise bse
+											  where bse.Address_Line_1__c is not null
+										)a
+								where R_no=1
+							)bse
+						 on	tgt.Fax_Number__c=bse.Fax_Number__c
+					  where	tgt.Address_Line_1__c  is null
+
+				------------------Update Phone using Complete Address--------------------
+					 update tgt
+						set	Phone_1__c=bse.Phone_1__c 
+					   from	#temp_RelQap_Data tgt
+				 inner join (
+								 select *
+								   from
+										(
+											 select	Address_Line_1__c
+													,Address_Line_2__c
+													,State__c
+													,ZIP_Code__c
+													,City__c
+													,Phone_1__c
+													,Phone_2__c
+													,Fax_Number__c
+													,Practice_Name__c
+													,row_number() over(Partition by bse.Phone_1__c order by bse.LastmodifiedDate ,bse.CreatedDate desc,Complete_Address) as R_no
+											   from	#temp_RelQap_Data bse
+											  where bse.Phone_1__c is not null
+										)a
+								where R_no=1
+							)bse
+						 on	tgt.Address_Line_1__c=bse.Address_Line_1__c
+						and tgt.Address_Line_2__c=bse.Address_Line_2__c
+						and tgt.City__c=bse.City__c
+						and tgt.State__c=bse.State__c
+						and tgt.ZIP_Code__c=bse.ZIP_Code__c
+					  where	tgt.Phone_1__c is null
+
+				------------------Update Phone using Complete Address and Practice_Name--------------------
+					 update	tgt
+						set	Phone_1__c=bse.Phone_1__c 
+					   from	#temp_RelQap_Data tgt
+				 inner join (
+								 select *
+								   from
+										(
+											 select	Address_Line_1__c
+													,Address_Line_2__c
+													,State__c
+													,ZIP_Code__c
+													,City__c
+													,Phone_1__c
+													,Phone_2__c
+													,Fax_Number__c
+													,Practice_Name__c
+													,row_number() over(Partition by bse.Phone_1__c order by bse.LastmodifiedDate ,bse.CreatedDate desc,Complete_Address) as R_no
+											   from	#temp_RelQap_Data bse
+											  where bse.Phone_1__c is not null
+										)a
+								where R_no=1
+							)bse
+						 on	tgt.Address_Line_1__c=bse.Address_Line_1__c
+						and tgt.City__c=bse.City__c
+						and tgt.State__c=bse.State__c
+						and tgt.ZIP_Code__c=bse.ZIP_Code__c
+						and tgt.Practice_Name__c=bse.Practice_Name__c
+					  where	tgt.Phone_1__c is null
+
+				------------------Update Phone using Practice_Name and Zip--------------------
+					   update tgt
+						set	Phone_1__c=bse.Phone_1__c 
+					   from	#temp_RelQap_Data tgt
+				 inner join (
+								 select *
+								   from
+										(
+											 select	Address_Line_1__c
+													,Address_Line_2__c
+													,State__c
+													,ZIP_Code__c
+													,City__c
+													,Phone_1__c
+													,Phone_2__c
+													,Fax_Number__c
+													,Practice_Name__c
+													,row_number() over(Partition by bse.Phone_1__c order by bse.LastmodifiedDate desc,bse.CreatedDate desc,Complete_Address) as R_no
+											   from	#temp_RelQap_Data bse
+											  where bse.Phone_1__c is not null
+										)a
+								where R_no=1
+							)bse
+						 on	tgt.ZIP_Code__c=bse.ZIP_Code__c
+						and tgt.Practice_Name__c=bse.Practice_Name__c
+					  where	tgt.Phone_1__c is null
+
+				------------------Update Phone using Practice_Name and Phone_2--------------------
+					 update	tgt
+						set	Phone_1__c=bse.Phone_1__c 
+					   from	#temp_RelQap_Data tgt
+				 inner join (
+								 select *
+								   from
+										(
+											 select	Address_Line_1__c
+													,Address_Line_2__c
+													,State__c
+													,ZIP_Code__c
+													,City__c
+													,Phone_1__c
+													,Phone_2__c
+													,Fax_Number__c
+													,Practice_Name__c
+													,row_number() over(Partition by bse.Phone_1__c order by bse.LastmodifiedDate desc,bse.CreatedDate desc,Complete_Address) as R_no
+											   from	#temp_RelQap_Data bse
+											  where bse.Phone_1__c is not null
+										)a
+								where R_no=1
+							)bse
+						 on	tgt.Phone_2__c=bse.Phone_2__c
+						and tgt.Practice_Name__c=bse.Practice_Name__c
+					  where	tgt.Phone_1__c is null
+
+					  --alter table dw.lkp_Standardized_Address_forAll
+					  --drop column Practice_Name__c varchar(250)
+				/******************************MELISSA STANDARDIZATION***********************************/
+                    
+				--if object_id('stg.lidPrep_LidForMellissa') is not null drop table stg.lidPrep_LidForMellissa
+
+				--	 select rel_qap_data.Practice_Name__c
+				--			,rel_qap_data.Address_Line_1__c
+				--			,rel_qap_data.Address_Line_2__c
+				--			,rel_qap_data.City__c
+				--			,rel_qap_data.State__c
+				--			,rel_qap_data.ZIP_Code__c
+				--			,rel_qap_data.Phone_1__c
+				--			,rel_qap_data.Phone_2__c
+				--			,rel_qap_data.Fax_Number__c
+				--			,rel_qap_data.Fax_Number_Console__c
+				--			,rel_qap_data.Fax_Number_For_Display__c 
+				--	   into stg.lidPrep_LidForMellissa
+				--	   from	#temp_RelQap_Data rel_qap_data 
+				--  left join dw.lkp_Standardized_Address_forAll lkp_stdized_add 
+				--		 on	isnull(rel_qap_data.Address_Line_1__c,'')   = isnull(lkp_stdized_add.Address_Line_1__c,'')
+				--		and isnull(rel_qap_data.Address_Line_2__c,'')   = isnull(lkp_stdized_add.Address_Line_2__c,'')
+				--		and isnull(rel_qap_data.City__c,'')             = isnull(lkp_stdized_add.City__c,'')
+				--		and isnull(rel_qap_data.State__c,'')            = isnull(lkp_stdized_add.State__c,'')
+				--		and isnull(rel_qap_data.ZIP_Code__c,'')         = isnull(lkp_stdized_add.ZIP_Code__c,'')
+				--	  where lkp_stdized_add.Address_Line_1__c is null
+
+				--	  union all
+
+				--	 select	rel_qap_data.Address_Line
+				--			,rel_qap_data.Address_Line_Suite
+				--			,rel_qap_data.City__c
+				--			,rel_qap_data.State__c
+				--			,rel_qap_data.ZIP_Code__c
+				--			,dbo.fn_cleanse_phone(rel_qap_data.Phone_Number_1                    ) as Phone_1__c
+				--			,dbo.fn_cleanse_phone(rel_qap_data.Phone_Number_2                    ) as Phone_2__c
+				--			,dbo.fn_cleanse_phone(rel_qap_data.Fax_Number__c                     ) as Fax_Number__c
+				--			,null
+				--			,null
+				--	   from	#temp_rel_qap_data rel_qap_data 
+				--  left join	dw.lkp_Standardized_Address_forAll lkp_stdized_add
+				--	     on	isnull(rel_qap_data.Address_Line		,'')	= isnull(lkp_stdized_add.Address_Line_1__c	,'')
+				--	    and	isnull(rel_qap_data.Address_Line_Suite	,'')	= isnull(lkp_stdized_add.Address_Line_2__c	,'')
+				--	    and	isnull(rel_qap_data.City__c				,'')    = isnull(lkp_stdized_add.City__c			,'')
+				--	    and	isnull(rel_qap_data.State__c			,'')    = isnull(lkp_stdized_add.State__c			,'')
+				--	    and	isnull(rel_qap_data.ZIP_Code__c			,'')    = isnull(lkp_stdized_add.ZIP_Code__c		,'')
+				--	  where	lkp_stdized_add.Address_Line_1__c is null
+
+
+					   --*****EXTERNAL SSIS JOB CALL*****Melissa Standarizer
+						--truncate table stg.lidPrep_LidData_MellissaStandardized  --Target truncate
+						/**************************************************
+				
+						---AS PART OF the below job are the required need to be passed on using SSIS
+						---stg.lidPrep_LidForMellissa to stg.lidPrep_LidData_MellissaStandardized
+						By Running Melissa Standarizer SSIS Job:
+						SRC: stg.lidPrep_LidForMellissa
+						JOB: [pkg__Generic_AddressStandardizationGeoCoding.dtsx].[tsk__ProviderAddressStandardizationGeoCoding_FlatFile]
+						TGT: Flat file path is "C:\Users\ESPL4137\Downloads\MelissaStandardized.txt"
+						LOAD: Manually load  standardized results in stg.lidPrep_LidData_MellissaStandardized 
+						***************************************************/
+						 ---******BUILD STD. ADDRESS REF. FROM ACROSS PROJECTS******---
+
+			 --           insert into dw.lkp_Standardized_Address_forAll
+			 --           (    
+							--Address_Line_1__c,Address_Line_2__c,City__c,State__c,ZIP_Code__c,MD_CompanyName,
+							--MD_AddressLine1,MD_AddressLine2,MD_City,MD_State,MD_PostalCode, MD_Lattitude, MD_Longitude
+			 --           )
+						 --select	 Address_Line_1__c
+							--	,Address_Line_2__c
+							--	,City__c
+							--	,State__c
+							--	,ZIP_Code__c
+							--	,MellissaStandardized.MD_CompanyName
+							--	,MellissaStandardized.MD_AddressLine1
+							--	,MellissaStandardized.MD_AddressLine2
+							--	,MellissaStandardized.MD_City
+							--	,MellissaStandardized.MD_State
+							--	,MellissaStandardized.MD_PostalCode
+							--	,MellissaStandardized.MD_Lattitude
+							--	,MellissaStandardized.MD_Longitude
+						 --  from	stg.lidPrep_LidData_MellissaStandardized MellissaStandardized
+	
+
+				----------------*******STANDAIZE DATA*****------------------
+
+					if object_id('tempdb..#temp_lidPrep_LidData_LkpStandardized') is not null drop table #temp_lidPrep_LidData_LkpStandardized 
+
+						 select	rel_qap_data.Location__c
+								,rel_qap_data.sfdc_Lid
+								,rel_qap_data.Address_Line_1__c
+								,rel_qap_data.Address_Line_2__c
+								,rel_qap_data.City__c
+								,rel_qap_data.State__c
+								,rel_qap_data.ZIP_Code__c
+								,rel_qap_data.Phone_1__c     as Phone_1__c
+								,rel_qap_data.Phone_2__c     as Phone_2__c
+								,rel_qap_data.Fax_Number__c  as Fax_Number__c
+								,rel_qap_data.Fax_Number__c  as Fax_Number_Console__c
+								,rel_qap_data.Fax_Number__c  as Fax_Number_For_Display__c
+								,lkp_stdized_add.MD_CompanyName
+								,lkp_stdized_add.MD_AddressLine1
+								,lkp_stdized_add.MD_AddressLine2
+								,lkp_stdized_add.MD_City
+								,lkp_stdized_add.MD_State
+								,lkp_stdized_add.MD_PostalCode
+								,lkp_stdized_add.MD_Lattitude
+								,lkp_stdized_add.MD_Longitude
+						   into	#temp_lidPrep_LidData_LkpStandardized
+						   from	#temp_RelQap_Data rel_qap_data--stg.lidPrep_pljCharts_RelQap_AetnaComm2017 rel_qap_data 
+					 inner join	dw.lkp_Standardized_Address_forAll lkp_stdized_add
+							 on	isnull(rel_qap_data.Address_Line_1__c	,'')	= isnull(lkp_stdized_add.Address_Line_1__c	,'')
+							and isnull(rel_qap_data.Address_Line_2__c	,'')	= isnull(lkp_stdized_add.Address_Line_2__c	,'')
+							and isnull(rel_qap_data.City__c				,'')	= isnull(lkp_stdized_add.City__c			,'')
+							and isnull(rel_qap_data.State__c			,'')	= isnull(lkp_stdized_add.State__c			,'')
+							and isnull(rel_qap_data.ZIP_Code__c			,'')	= isnull(lkp_stdized_add.ZIP_Code__c		,'') 
+
+				-----------------MD5 HASH KEY GENERATION BASED ON ADD PH1 & PH2------------------------------------------
+				if object_id('tempdb..#temp_poc_location_master_hash_gen') is not null drop table #temp_poc_location_master_hash_gen
+					select	rel_qap_data.Location__c
+							,rel_qap_data.SFDC_LID
+							,case 
+								when StandardisedRecords.MD_AddressLine1 is not null
+									then
+										convert(  varchar(32), HashBytes('MD5',
+										'#$%^&' + StandardisedRecords.MD_AddressLine1 + ' ' + isnull(StandardisedRecords.MD_AddressLine2,'') + '&^%$#'
+										+'#$%^&' + isnull(StandardisedRecords.MD_City,'') + '&^%$#'
+										+'#$%^&' + isnull(StandardisedRecords.MD_State,'') + '&^%$#'
+										+'#$%^&' + isnull(StandardisedRecords.MD_PostalCode,'') + '&^%$#'
+										+'#$%^&' +
+											case 
+												when isnull(rel_qap_data.Phone_1__c,'') >=   isnull(rel_qap_data.Phone_2__c,'') 
+													then isnull(rel_qap_data.Phone_1__c,'')+' '+isnull(rel_qap_data.Phone_2__c,'')
+												else isnull(rel_qap_data.Phone_2__c,'')+' '+isnull(rel_qap_data.Phone_1__c,'')
+											end + '&^%$#')
+										, 2) 
+								when  (rel_qap_data.Phone_1__c is not null or rel_qap_data.Phone_2__c is not null) 
+										then
+										convert(  varchar(32), HashBytes('MD5','#$%^&' +  
+											case 
+												when isnull(rel_qap_data.Phone_1__c,'') >=   isnull(rel_qap_data.Phone_2__c,'') 
+													then isnull(rel_qap_data.Phone_1__c,'')+' '+isnull(rel_qap_data.Phone_2__c,'')
+												else isnull(rel_qap_data.Phone_2__c,'')+' '+isnull(rel_qap_data.Phone_1__c,'')
+											end+ '&^%$#')
+										, 2)
+								else 
+										convert(  varchar(32), HashBytes('MD5',
+												'#$%^&' +
+													case
+															when isnull(rel_qap_data.Fax_Number__c,'') >= isnull(rel_qap_data.Fax_Number_Console__c,'') and isnull(rel_qap_data.Fax_Number__c,'') >= isnull(rel_qap_data.Fax_Number_For_Display__c,'') 
+																then isnull(rel_qap_data.Fax_Number__c,'')
+															when isnull(rel_qap_data.Fax_Number_Console__c,'') >= isnull(rel_qap_data.Fax_Number__c,'') and isnull(rel_qap_data.Fax_Number_Console__c,'') >= isnull(rel_qap_data.Fax_Number_For_Display__c,'') 
+																then isnull(rel_qap_data.Fax_Number_Console__c,'')
+															when isnull(rel_qap_data.Fax_Number_For_Display__c,'') >= isnull(rel_qap_data.Fax_Number__c,'') and isnull(rel_qap_data.Fax_Number_For_Display__c,'') >= isnull(rel_qap_data.Fax_Number_Console__c,'') 
+																then isnull(rel_qap_data.Fax_Number_For_Display__c,'')
+															else isnull(rel_qap_data.Fax_Number__c,'')
+													end + '&^%$#')
+										, 2)
+							end NEW_LID_ALL
+							--Contact Info
+							,rel_qap_data.Client_Name__c
+							,rel_qap_data.Contact_Person__c
+							,rel_qap_data.Contact_Person_2__c
+							,rel_qap_data.Practice_Name__c
+							,case 
+								when  len(isnull(StandardisedRecords.MD_PostalCode,rel_qap_data.ZIP_Code__c)) < 5 then '0'+ StandardisedRecords.MD_PostalCode 
+								else isnull(StandardisedRecords.MD_PostalCode,rel_qap_data.ZIP_Code__c)
+							end as ZIP_Code__c
+							,isnull(StandardisedRecords.MD_AddressLine1,rel_qap_data.Address_Line_1__c)						as MD_AddressLine1
+							,isnull(StandardisedRecords.MD_AddressLine2,rel_qap_data.Address_Line_2__c)						as MD_AddressLine2
+							,isnull(StandardisedRecords.MD_City,rel_qap_data.City__c)										as MD_City
+							,isnull(StandardisedRecords.MD_State,rel_qap_data.State__c)										as MD_State
+							,isnull(StandardisedRecords.MD_PostalCode,rel_qap_data.ZIP_Code__c)								as MD_PostalCode
+							,isnull(StandardisedRecords.Phone_1__c,rel_qap_data.Phone_1__c)									as Phone_1__c
+							,isnull(StandardisedRecords.Phone_2__c,rel_qap_data.Phone_2__c)									as Phone_2__c
+							,isnull(StandardisedRecords.Fax_Number__c,rel_qap_data.Col_Fax_Number__c)						as Fax_Number__c
+							,isnull(StandardisedRecords.Fax_Number_Console__c,rel_qap_data.Fax_Number_Console__c)			as Fax_Number_Console__c
+							,isnull(StandardisedRecords.Fax_Number_For_Display__c,rel_qap_data.Fax_Number_For_Display__c)	as Fax_Number_For_Display__c    
+							,isnull(StandardisedRecords.MD_Lattitude,rel_qap_data.Location__Latitude__s)					as Location__Latitude__s      
+							,isnull(StandardisedRecords.MD_Longitude,rel_qap_data.Location__Longitude__s)					as Location__Longitude__s
+
+							--Provider Address
+							,rel_qap_data.Provider_Full_Address
+							,rel_qap_data.Provider_Address_1
+							,rel_qap_data.Provider_Address_2
+							,rel_qap_data.Provider_City
+							,rel_qap_data.Provider_State
+							,rel_qap_data.Provider_ZIP_Code
+
+							--Medical Records Storage
+							,rel_qap_data.Record_Storage_Type__c
+							,rel_qap_data.EMR_System__c
+							,rel_qap_data.EMR_Version__c
+							,rel_qap_data.Other_EMR_System__c
+
+							--Charts Information
+							,rel_qap_data.CreatedDate   
+							,rel_qap_data.LastModifiedDate
+							,rel_qap_data.Num_of_Charts__c
+							,rel_qap_data.Num_of_Charts_Scheduled__c                                   
+							,rel_qap_data.charts_at_loc charts_recovered_at_loc
+
+							--Chart Ret. Mode
+							--,ChartsAtLid.Best_Retreival_Type as Best_Retreival_Mode                                   
+							,rel_qap_data.charts_retreived_via_SFTP
+							,rel_qap_data.charts_retreived_via_MailRoom
+							,rel_qap_data.charts_retreived_via_Fax
+							,rel_qap_data.charts_retreived_via_eMail
+							,rel_qap_data.charts_retreived_via_CopyService
+							,rel_qap_data.charts_retreived_via_Field
+							,rel_qap_data.charts_retreived_via_NullOthers
+                                 
+							--Other Info
+							,rel_qap_data.Appointment_Type__c
+							,rel_qap_data.Workflow_Status__c
+							,rel_qap_data.Invoices__c
+							,rel_qap_data.PNP_Reason__c 
+							,rel_qap_data.Num_of_Calls__c
+							,rel_qap_data.Number_of_PNP__c
+					
+					   into	#temp_poc_location_master_hash_gen
+					   from	#temp_RelQap_Data as rel_qap_data--#temp_rel_qap_data stg.lidPrep_pljCharts_RelQap_AetnaComm2017 rel_qap_data 
+				  left join	#temp_lidPrep_LidData_LkpStandardized as StandardisedRecords   --lidPrep_LidData_MellissaStandardized_AetnaComm2017,stg.lidPrep_LidData_MellissaStandardized_AetnaMC2018 
+						 on	rel_qap_data.location__c = StandardisedRecords.location__c 
+		
+				if object_id('tempdb..#temp_poc_lm_locations_master_latest') is not null drop table #temp_poc_lm_locations_master_latest
+   
+				   ;with buildMaster as 
+				   (
+						 select	row_number()
+									over(partition by	NEW_LID_ALL 
+											order by	LastModifiedDate,lid_CreatedDate desc) as masteringFilter
+								,* 
+						   from	(
+									 select	NEW_LID_ALL
+											,isnull(Contact_Person__c,Contact_Person_2__c) as Contact_Person__c
+											,Practice_Name__c
+											,MD_AddressLine1 as Address_Line_1      
+											,MD_AddressLine2 as Address_Line_2
+											,MD_City as City__c
+											,MD_State as State__c
+											,MD_PostalCode as ZIP_Code__c
+											,Location__Latitude__s
+											,Location__Longitude__s  
+											,Phone_1__c
+											,Phone_2__c
+											,coalesce(Fax_Number__c,Fax_Number_Console__c,Fax_Number_For_Display__c) as FaxNumber
+											,CreatedDate lid_CreatedDate --INCLUDED TOWARDS CHART SELECTION BY MOST RECENT LOCATION
+											,LastModifiedDate
+											,Record_Storage_Type__c 
+											,case when EMR_System__c = 'Other' then Other_EMR_System__c else + EMR_System__c end +
+											case when EMR_Version__c is null then '' else '; Version: '+EMR_Version__c end EMR_Info
+									  from	#temp_poc_location_master_hash_gen
+
+									  union all
+
+									 select	New_lid
+											,Contact_Person
+											,Practice_Name
+											,Address_Line_1
+											,Address_Line_2
+											,City
+											,State
+											,ZIP_Code
+											,Location_Latitude
+											,Location_Longitude
+											,Phone_1
+											,Phone_2
+											,FaxNumber
+											,lid_CreatedDate
+											,LastModifiedDate
+											,Record_Storage_Type
+											,EMR_Info
+									   from	dw.Tb_LidMastering_LocationMaster
+								)a
+					)
+			
+
+					 select	NEW_LID_ALL new_lid
+							,Contact_Person__c
+							,Practice_Name__c
+							,Address_Line_1      
+							,Address_Line_2
+							,City__c
+							,State__c
+							,ZIP_Code__c
+							,Location__Latitude__s
+							,Location__Longitude__s  
+							,Phone_1__c
+							,Phone_2__c
+							,FaxNumber
+							,lid_CreatedDate --INCLUDED TOWARDS CHART SELECTION BY MOST RECENT LOCATION
+							,LastModifiedDate
+							,Record_Storage_Type__c 
+							,EMR_Info
+					   into	#temp_poc_lm_locations_master_latest 
+					   from	buildMaster
+					  where	masteringFilter = 1 
+
+				if object_id('tempdb..#location_master_summed') is not null drop table #location_master_summed 
+
+					;with location_master as 
+					(
+						select	new_lid
+								--Contact Info
+								,max(Contact_Person__c  ) as Contact_Person__c
+								,max(Contact_Person_2__c) as Contact_Person_2__c
+								,max(Practice_Name__c ) as Practice_Name__c
+								,max(FaxNumber) as FaxNumber                      
+								--Charts Information
+								,sum(Num_of_Charts__c) charts_numbers_at_loc                            
+								,sum(charts_recovered_at_loc) charts_recovered_at_loc
+								--,max(Best_Retreival_Type                  ) as Best_Retreival_Type  ---Need to recalculate
+								,sum(charts_retreived_via_SFTP            ) as charts_retreived_via_SFTP
+								,sum(charts_retreived_via_MailRoom        ) as charts_retreived_via_MailRoom
+								,sum(charts_retreived_via_Fax             ) as charts_retreived_via_Fax
+								,sum(charts_retreived_via_eMail           ) as charts_retreived_via_eMail
+								,sum(charts_retreived_via_CopyService     ) as charts_retreived_via_CopyService
+								,sum(charts_retreived_via_Field           ) as charts_retreived_via_Field
+								,sum(charts_retreived_via_NullOthers      ) as charts_retreived_via_NullOthers 
+								,sum(Num_of_Calls__c) as Num_of_Calls
+								--Medical Records Storage
+								,max(Record_Storage_Type__c) as Record_Storage_Type__c 
+								,max(EMR_Info) as EMR_Info
+								--,max(Copy_Service__c       ) as Copy_Service__c
+						   from	(
+									 select	NEW_LID_ALL new_lid
+											,Contact_Person__c
+											,Contact_Person_2__c
+											,Practice_Name__c
+											,isnull(isnull(Fax_Number__c,Fax_Number_Console__c),Fax_Number_For_Display__c) as FaxNumber
+											,Num_of_Charts__c
+											,charts_recovered_at_loc
+											,charts_retreived_via_SFTP
+											,charts_retreived_via_MailRoom        
+											,charts_retreived_via_Fax             
+											,charts_retreived_via_eMail           
+											,charts_retreived_via_CopyService     
+											,charts_retreived_via_Field           
+											,charts_retreived_via_NullOthers
+											,Num_of_Calls__c 
+											,Record_Storage_Type__c
+											,case when EMR_System__c = 'Other' then Other_EMR_System__c else + EMR_System__c end 
+											+case when EMR_Version__c is null then '' else '; Version: '+EMR_Version__c end EMR_Info
+									   from	#temp_poc_location_master_hash_gen--48902
+
+										union all
+
+									 select	New_lid
+											,Contact_Person
+											,Contact_Person
+											,Practice_Name
+											,FaxNumber
+											,charts_numbers_at_loc
+											,charts_recovered_at_loc
+											,charts_retreived_via_SFTP
+											,charts_retreived_via_MailRoom        
+											,charts_retreived_via_Fax             
+											,charts_retreived_via_eMail           
+											,charts_retreived_via_CopyService     
+											,charts_retreived_via_Field           
+											,charts_retreived_via_NullOthers 
+											,Num_of_Calls
+											,Record_Storage_Type
+											,EMR_Info
+									   from	dw.Tb_LidMastering_LocationMaster
+			  
+							)a
+					  group by	new_lid
+					  )
+
+					 select	location_master.new_lid
+							,isnull(Contact_Person__c,'')+case when rtrim(ltrim(Contact_Person_2__c)) is null then '' else ' OR '+rtrim(ltrim(Contact_Person_2__c)) end as Contact_Person__c
+							,Practice_Name__c
+							,FaxNumber
+							,charts_numbers_at_loc
+							,charts_recovered_at_loc
+							,charts_retreived_via_SFTP
+							,charts_retreived_via_MailRoom
+							,charts_retreived_via_Fax
+							,charts_retreived_via_eMail
+							,charts_retreived_via_CopyService
+							,charts_retreived_via_Field
+							,charts_retreived_via_NullOthers 
+							,Num_of_Calls
+							,Record_Storage_Type__c
+							,EMR_Info
+					   into	#location_master_summed
+					   from	location_master
+
+					if object_id('tempdb..#temp_poc_lm_sfdcLid_newLid_map') is not null drop table #temp_poc_lm_sfdcLid_newLid_map
+
+						 select	distinct New_lid_all
+								,SFDC_LID
+								,location__c
+					       into	#temp_poc_lm_sfdcLid_newLid_map  
+					       from	(
+								 select	New_lid_all
+										,SFDC_LID
+										,location__c
+								   from	#temp_poc_location_master_hash_gen 
+
+								union all
+
+								 select	Mas.New_lid
+										,S_DATA
+										,Location2__c.id
+								   from	dw.Tb_LidMastering_LocationMaster Mas 
+							cross apply dbo.UDF_SPLIT_BY_CHAR(Mas.Sflids,',') as Sp
+							 inner join Location2__c
+									 on	Location2__c.name=Sp.S_DATA
+							)a
+
+		
+				if object_id('tempdb..#temp_location_master_consolidated') is not null drop table #temp_location_master_consolidated
+
+						 select	lt.new_lid
+								,isnull(lt.Contact_Person__c, summ.Contact_Person__c) as Contact_Person__c
+								,isnull(lt.Practice_Name__c, summ.Practice_Name__c) as Practice_Name__c
+								,lt.Address_Line_1
+								,lt.Address_Line_2
+								,lt.City__c
+								,lt.State__c
+								,lt.ZIP_Code__c
+								,isnull(lt.Address_Line_1,'')+isnull(lt.Address_Line_2,'')+isnull(lt.City__c,'')+isnull(lt.State__c,'')+isnull(lt.ZIP_Code__c,'') as Complete_Address
+								,lt.Location__Latitude__s
+								,lt.Location__Longitude__s  
+								,lt.Phone_1__c
+								,lt.Phone_2__c
+								,isnull(lt.FaxNumber, summ.FaxNumber) as FaxNumber
+								,lt.lid_CreatedDate
+								,lt.LastModifiedDate
+								,summ.charts_numbers_at_loc
+								,summ.charts_recovered_at_loc
+								,summ.charts_retreived_via_SFTP
+								,summ.charts_retreived_via_MailRoom
+								,summ.charts_retreived_via_Fax
+								,summ.charts_retreived_via_eMail
+								,summ.charts_retreived_via_CopyService
+								,summ.charts_retreived_via_Field
+								,summ.charts_retreived_via_NullOthers
+								,summ.Num_of_Calls
+								,isnull(lt.Record_Storage_Type__c,summ.Record_Storage_Type__c) as Record_Storage_Type__c
+								,isnull(lt.EMR_Info,summ.EMR_Info ) as EMR_Info
+						   into	#temp_location_master_consolidated
+						   from	#temp_poc_lm_locations_master_latest lt
+					 inner join	#location_master_summed summ
+							 on	lt.new_lid = summ.new_lid
+			
+				
+						/*******************************************LID_MERGE_BY_PHONE******************************************/
+
+							if object_id('tempdb..#temp_lid_merge_by_Phone') is not null drop table #temp_lid_merge_by_Phone
+
+							create table #temp_lid_merge_by_Phone
+							(
+								old_id varchar(64),new_id varchar(64),new_created_date datetime,Old_created_date datetime,By_Name varchar(30)
+							)										  
+
+							Declare @sql nvarchar(max),@Row_Count int=0,@Tot_Row_Count int=1
+
+							set @sql=
+							N'
+							;with cte_details as
+							(
+								 select	a.new_id,
+										c.Practice_Name__c
+										,c.Location__Latitude__s
+										,c.Location__Longitude__s
+										,c.Phone_1__c
+										,c.Phone_2__c
+										,c.FaxNumber
+										,c.lid_CreatedDate
+										,c.Record_Storage_Type__c
+										,c.EMR_Info
+										,ROW_NUMBER() over (Partition by a.new_id order by c.lid_CreatedDate) as R_no
+								   from	#temp_lid_merge_by_Phone a
+							  left join	#temp_location_master_consolidated c on c.new_lid=a.old_id
+							),
+							cte_summary as
+							(
+								 select	a.new_id
+										,max(c.Practice_Name__c) as Practice_Name__c
+										,max(c.Location__Latitude__s) as Location__Latitude__s
+										,max(c.Location__Longitude__s) as Location__Longitude__s
+										,max(c.Phone_1__c) as Phone_1__c
+										,max(c.Phone_2__c) as Phone_2__c
+										,max(c.FaxNumber) as FaxNumber
+										,max(c.lid_CreatedDate) as lid_CreatedDate
+										,sum(c.charts_numbers_at_loc) as charts_numbers_at_loc
+										,sum(c.charts_recovered_at_loc) as charts_recovered_at_loc
+										,sum(c.charts_retreived_via_SFTP) as charts_retreived_via_SFTP
+										,sum(c.charts_retreived_via_MailRoom) as charts_retreived_via_MailRoom
+										,sum(c.charts_retreived_via_Fax) as charts_retreived_via_Fax
+										,sum(c.charts_retreived_via_eMail) as charts_retreived_via_eMail
+										,sum(c.charts_retreived_via_CopyService) as charts_retreived_via_CopyService
+										,sum(c.charts_retreived_via_Field) as charts_retreived_via_Field
+										,sum(c.charts_retreived_via_NullOthers) as charts_retreived_via_NullOthers
+										,sum(c.Num_of_Calls) as Num_of_Calls
+										,max(c.Record_Storage_Type__c) as Record_Storage_Type__c
+										,max(c.EMR_Info) as EMR_Info
+								   from	#temp_lid_merge_by_Phone a
+							 inner join	#temp_location_master_consolidated c on c.new_lid=a.old_id
+							   group by	a.new_id
+							)
+			
+							update	a 
+								set 
+									Practice_Name__c=iif(a.lid_CreatedDate>b.lid_CreatedDate,isnull(a.Practice_Name__c,b.Practice_Name__c),isnull(b.Practice_Name__c,a.Practice_Name__c))
+									,Location__Latitude__s=iif(a.lid_CreatedDate>b.lid_CreatedDate,isnull(a.Location__Latitude__s,b.Location__Latitude__s),isnull(b.Location__Latitude__s,a.Location__Latitude__s))
+									,Location__Longitude__s=iif(a.lid_CreatedDate>b.lid_CreatedDate,isnull(a.Location__Longitude__s,b.Location__Longitude__s),isnull(b.Location__Longitude__s,a.Location__Longitude__s))
+									,Phone_1__c=iif(a.lid_CreatedDate>b.lid_CreatedDate,isnull(a.Phone_1__c,b.Phone_1__c),isnull(b.Phone_1__c,a.Phone_1__c))
+									,Phone_2__c=iif(a.lid_CreatedDate>b.lid_CreatedDate,isnull(a.Phone_2__c,b.Phone_2__c),isnull(b.Phone_2__c,a.Phone_2__c))
+									,FaxNumber=iif(a.lid_CreatedDate>b.lid_CreatedDate,isnull(a.FaxNumber,b.FaxNumber),isnull(b.FaxNumber,a.FaxNumber))
+									,charts_numbers_at_loc=isnull(a.charts_numbers_at_loc,0) + isnull(b.charts_numbers_at_loc,0)
+									,charts_recovered_at_loc=isnull(a.charts_recovered_at_loc,0)+isnull(b.charts_recovered_at_loc,0)
+									--,Percent_of_Charts_Recovered__c=cast(round(100*((isnull(a.charts_recovered_at_loc,0)+isnull(b.charts_recovered_at_loc,0))/(isnull(a.charts_numbers_at_loc,0)+isnull(b.charts_numbers_at_loc,0))),2,1) as decimal(18,2))
+									,charts_retreived_via_SFTP=isnull(a.charts_retreived_via_SFTP,0)+isnull(b.charts_retreived_via_SFTP,0)
+									,charts_retreived_via_MailRoom=isnull(a.charts_retreived_via_MailRoom,0)+isnull(b.charts_retreived_via_MailRoom,0)
+									,charts_retreived_via_Fax=isnull(a.charts_retreived_via_Fax,0)+isnull(b.charts_retreived_via_Fax,0)
+									,charts_retreived_via_eMail=isnull(a.charts_retreived_via_eMail,0)+isnull(b.charts_retreived_via_eMail,0)
+									,charts_retreived_via_CopyService=isnull(a.charts_retreived_via_CopyService,0)+isnull(b.charts_retreived_via_CopyService,0)
+									,charts_retreived_via_Field=isnull(a.charts_retreived_via_Field,0)+isnull(b.charts_retreived_via_Field,0)
+									,charts_retreived_via_NullOthers=isnull(a.charts_retreived_via_NullOthers,0)+isnull(b.charts_retreived_via_NullOthers,0)
+									,Num_of_Calls=isnull(a.Num_of_Calls,0)+isnull(b.Num_of_Calls,0)
+									,Record_Storage_Type__c=iif(a.lid_CreatedDate>b.lid_CreatedDate,isnull(a.Record_Storage_Type__c,b.Record_Storage_Type__c),isnull(b.Record_Storage_Type__c,a.Record_Storage_Type__c))
+									,EMR_Info=iif(a.lid_CreatedDate>b.lid_CreatedDate,isnull(a.EMR_Info,b.EMR_Info),isnull(b.EMR_Info,a.EMR_Info))
+							   from	#temp_location_master_consolidated a
+						 inner join
+									(
+										 select	a.new_id
+												,isnull(a.Practice_Name__c,b.Practice_Name__c) as Practice_Name__c
+												,isnull(a.Location__Latitude__s,b.Location__Latitude__s) as Location__Latitude__s
+												,isnull(a.Location__Longitude__s,b.Location__Longitude__s) as Location__Longitude__s
+												,isnull(a.Phone_1__c,b.Phone_1__c) as Phone_1__c
+												,isnull(a.Phone_2__c,b.Phone_2__c) as Phone_2__c
+												,isnull(a.FaxNumber,b.FaxNumber) as FaxNumber
+												,a.lid_CreatedDate
+												,charts_numbers_at_loc
+												,charts_recovered_at_loc
+												,charts_retreived_via_SFTP
+												,charts_retreived_via_MailRoom
+												,charts_retreived_via_Fax
+												,charts_retreived_via_eMail
+												,charts_retreived_via_CopyService
+												,charts_retreived_via_Field
+												,charts_retreived_via_NullOthers
+												,Num_of_Calls
+												,a.Record_Storage_Type__c
+												,a.EMR_Info
+										   from	cte_details a
+									 inner join cte_summary b on a.new_id=b.new_id
+										  where	a.R_no=1
+									)b
+								 on	a.new_lid=b.new_id
+						-------------------------Delete Old Lid After Merging----------------------------------
+							 delete	a 
+							   from	#temp_location_master_consolidated a
+						 inner join	#temp_lid_merge_by_Phone b 
+								 on	a.new_lid=b.old_id
+
+							 update	tgt
+								set new_lid_all=bse.new_id 
+							   from	#temp_poc_lm_sfdcLid_newLid_map tgt
+						 inner join	#temp_lid_merge_by_Phone bse 
+								 on	tgt.new_lid_all=bse.old_id
+
+								set @Row_Count=@@Rowcount
+
+						   truncate	table #temp_lid_merge_by_Phone
+							'
+
+						while @Tot_Row_Count > 0
+						begin
+					
+							select @Tot_Row_Count=0,@Row_Count=0
+
+							Truncate table #temp_lid_merge_by_Phone
+
+							-------------------Phone 2 null Merge by Phone 1--------------------------------
+							insert into #temp_lid_merge_by_Phone
+							(
+								old_id,new_id,By_Name
+							)
+							 select	Pnull.new_lid as old_id
+									,nnull.new_lid as new_id
+									,'Phone1'
+							   from	#temp_location_master_consolidated as Pnull
+						 inner join	
+									(
+										select	*
+										from
+										(
+												 select	new_lid
+														,Complete_Address
+														,Phone_1__c
+														,Phone_2__c
+														,lid_CreatedDate
+														,row_number() over (partition by Complete_Address,Phone_1__c order by LastModifiedDate desc,lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+												   from	#temp_location_master_consolidated
+												  where	Phone_1__c is not null 
+													and Phone_2__c is not null
+										)a
+										where r_no=1
+									) as nnull
+								 on	Pnull.Complete_Address=nnull.Complete_Address
+								and Pnull.Phone_1__c=nnull.Phone_1__c
+							  where	Pnull.Phone_2__c is null
+					  
+							exec sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							select @Tot_Row_Count=@Tot_Row_Count+@Row_Count
+
+							-------------------Phone 1 null Merge by Phone 2--------------------------------
+
+							insert into #temp_lid_merge_by_Phone
+							(
+								old_id,new_id,By_Name
+							)
+							 select	Pnull.new_lid as old_id
+									,nnull.new_lid as new_id
+									,'Phone2'
+							   from	#temp_location_master_consolidated as Pnull
+						 inner join	
+									(
+										select	*
+										from
+										(
+												select	new_lid
+														,Complete_Address
+														,Phone_1__c
+														,Phone_2__c
+														,row_number() over (partition by Complete_Address,Phone_2__c order by Cons.LastModifiedDate desc,cons.lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+												   from	#temp_location_master_consolidated Cons
+												  where	Phone_1__c is not null 
+													and Phone_2__c is not null
+										)a
+										where r_no=1
+									) as nnull
+								 on	Pnull.Complete_Address=nnull.Complete_Address
+								and Pnull.Phone_2__c=nnull.Phone_2__c
+							  where	Pnull.Phone_1__c is null
+
+							  exec sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							  select @Tot_Row_Count=@Tot_Row_Count+@Row_Count
+
+							-------------------Phone 2 null Merge by Phone 2--------------------------------
+
+							insert into #temp_lid_merge_by_Phone
+							(
+								old_id,new_id,By_Name
+							)
+							 select	Pnull.new_lid as old_id
+									,nnull.new_lid as new_id
+									,'Phone1&2'
+							   from	#temp_location_master_consolidated as Pnull
+						 inner join	
+									(
+										select	*
+										from
+										(
+												select	Cons.new_lid
+														,Cons.Complete_Address
+														,Cons.Phone_1__c
+														,Cons.Phone_2__c
+														,row_number() over (partition by Cons.Complete_Address,Cons.Phone_2__c order by Cons.LastModifiedDate desc,cons.lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+												   from	#temp_location_master_consolidated Cons
+												  where Cons.Phone_2__c is not null
+										)a
+										where r_no=1
+									) as nnull
+								 on	Pnull.Complete_Address=nnull.Complete_Address
+								and Pnull.Phone_1__c=nnull.Phone_2__c
+							  where	Pnull.Phone_2__c is null
+
+							   exec	sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							 select	@Tot_Row_Count=@Tot_Row_Count+@Row_Count
+
+							-------------------Phone 1 null Merge by Phone 1--------------------------------
+
+							insert into #temp_lid_merge_by_Phone
+							(
+								old_id,new_id,By_Name
+							)
+							 select	Pnull.new_lid as old_id
+									,nnull.new_lid as new_id
+									,'Phone2&1'
+							   from	#temp_location_master_consolidated as Pnull
+						 inner join	
+									(
+										select	*
+										from
+										(
+												select	new_lid
+														,Complete_Address
+														,Phone_1__c
+														,Phone_2__c
+														,row_number() over (partition by Complete_Address,Phone_1__c order by Cons.LastModifiedDate desc,cons.lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+												   from	#temp_location_master_consolidated Cons
+												  where Phone_1__c is not null
+										)a
+										where r_no=1
+									) as nnull
+								 on	Pnull.Complete_Address=nnull.Complete_Address
+								and Pnull.Phone_2__c=nnull.Phone_1__c
+							  where	Pnull.Phone_1__c is null
+
+							   exec	sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							 select	@Tot_Row_Count=@Tot_Row_Count+@Row_Count
+
+						-------------------Merging Phone 1 not null Records--------------------------------
+
+							insert into #temp_lid_merge_by_Phone
+							(
+								old_id,new_id,By_Name
+							)
+							 select	Pnull.new_lid as old_id
+									,nnull.new_lid as new_id
+									,'Phone1&1'
+							   from	#temp_location_master_consolidated as Pnull
+						 inner join	
+									(
+										select	*
+										from
+										(
+												select	new_lid
+														,Complete_Address
+														,Phone_1__c
+														,Phone_2__c
+														,row_number() over (partition by Complete_Address,Phone_1__c order by Cons.LastModifiedDate desc,cons.lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+												   from	#temp_location_master_consolidated Cons
+												  where Phone_1__c is not null
+										)a
+										where r_no=1
+									) as nnull
+								 on	Pnull.Complete_Address=nnull.Complete_Address
+								and Pnull.Phone_1__c=nnull.Phone_1__c
+							  where	Pnull.Phone_1__c is not null
+								and	nnull.new_lid <> Pnull.new_lid
+
+							   exec	sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							 select	@Tot_Row_Count=@Tot_Row_Count+@Row_Count
+
+						-------------------Merging Phone 2 not null Records--------------------------------
+
+							insert into #temp_lid_merge_by_Phone
+							(
+								old_id,new_id,By_Name
+							)
+							 select	Pnull.new_lid as old_id
+									,nnull.new_lid as new_id
+									,'Phone1&2'
+							   from	#temp_location_master_consolidated as Pnull
+						 inner join	
+									(
+										select	*
+										from
+										(
+												select	new_lid
+														,Complete_Address
+														,Phone_1__c
+														,Phone_2__c
+														,row_number() over (partition by Complete_Address,Phone_1__c order by Cons.LastModifiedDate desc,cons.lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+												   from	#temp_location_master_consolidated Cons
+												  where Phone_2__c is not null
+										)a
+										where r_no=1
+									) as nnull
+								 on	Pnull.Complete_Address=nnull.Complete_Address
+								and Pnull.Phone_1__c=nnull.Phone_2__c
+							  where	Pnull.Phone_1__c is not null
+								and	nnull.new_lid <> Pnull.new_lid
+
+							   exec	sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							 select	@Tot_Row_Count=@Tot_Row_Count+@Row_Count
+						-------------------FaxNumber Merge--------------------------------
+
+							insert into #temp_lid_merge_by_Phone
+							(
+								old_id,new_id,new_created_date,Old_created_date,By_Name
+							)
+							select * from 
+							(
+							 select	Pnull.new_lid as old_id
+									,nnull.new_lid as new_id
+									,nnull.lid_CreatedDate as new_created_date
+									,Pnull.lid_CreatedDate as Old_created_date
+									,'FaxNumber' fax
+							   from	#temp_location_master_consolidated as Pnull
+						 inner join	
+									(
+										select	*
+										from
+										(
+												 select	cons.new_lid
+														,cons.Complete_Address
+														,cons.FaxNumber
+														,cons.lid_CreatedDate
+														,row_number() over (partition by cons.Complete_Address,cons.FaxNumber order by Cons.LastModifiedDate desc,cons.lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+												   from	#temp_location_master_consolidated cons
+												  where	cons.FaxNumber is not null
+										)a
+										where r_no=1
+									) as nnull
+								 on	Pnull.Complete_Address=nnull.Complete_Address
+								and Pnull.FaxNumber=nnull.FaxNumber
+							  where	Pnull.new_lid<>nnull.new_lid
+							  )a
+
+							   exec	sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							 select	@Tot_Row_Count=@Tot_Row_Count+@Row_Count
+
+						-------------------PracticeName Merge--------------------------------
+
+						insert into #temp_lid_merge_by_Phone
+						(
+							old_id,new_id,new_created_date,Old_created_date,By_Name
+						)
+							 select	Pnull.new_lid as old_id
+									,nnull.new_lid as new_id
+									,nnull.LastModifiedDate
+									,Pnull.LastModifiedDate
+									,'PracticeName' 
+							   from	#temp_location_master_consolidated as Pnull
+						 inner join	
+									(
+										select	*
+										from
+										(
+												 select	cons.new_lid
+														,cons.Complete_Address
+														,cons.Address_Line_1
+														,cons.City__c
+														,cons.State__c
+														,cons.ZIP_Code__c
+														,cons.Practice_Name__c
+														,LastModifiedDate
+														,lid_CreatedDate
+														,row_number() over (partition by cons.Complete_Address,cons.Practice_Name__c order by Cons.LastModifiedDate desc,cons.lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+												   from	#temp_location_master_consolidated cons
+												  where	cons.Practice_Name__c is not null
+										)a
+										where r_no=1
+									) as nnull
+								 on	isnull(Pnull.Address_Line_1,'')=isnull(nnull.Address_Line_1,'')
+								and isnull(Pnull.City__c,'')=isnull(nnull.City__c,'')
+								and isnull(Pnull.State__c,'')=isnull(nnull.State__c,'')
+								and isnull(Pnull.ZIP_Code__c,'')=isnull(nnull.ZIP_Code__c,'')
+								and Pnull.Practice_Name__c=nnull.Practice_Name__c
+							  where	Pnull.new_lid<>nnull.new_lid
+
+							   exec	sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							 select	@Tot_Row_Count=@Tot_Row_Count+@Row_Count
+
+
+						-------------------PracticeName and Phone 1 Merge --------------------------------
+
+						insert into #temp_lid_merge_by_Phone
+						(
+							old_id,new_id,new_created_date,Old_created_date,By_Name
+						)
+							 select	Pnull.new_lid as old_id
+									,nnull.new_lid as new_id
+									,nnull.LastModifiedDate
+									,Pnull.LastModifiedDate
+									,'PracticeName' 
+							   from	#temp_location_master_consolidated as Pnull
+						 inner join	
+									(
+										select	*
+										from
+										(
+												 select	cons.new_lid
+														,cons.Complete_Address
+														,cons.Address_Line_1
+														,cons.City__c
+														,cons.State__c
+														,cons.ZIP_Code__c
+														,cons.Practice_Name__c
+														,LastModifiedDate
+														,lid_CreatedDate
+														,Phone_1__c
+														,row_number() over (partition by cons.Complete_Address,cons.Practice_Name__c order by Cons.LastModifiedDate desc,cons.lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+												   from	#temp_location_master_consolidated cons
+												  where	cons.Practice_Name__c is not null
+										)a
+										where r_no=1
+									) as nnull
+								 on	Pnull.Phone_1__c=nnull.Phone_1__c
+								and Pnull.Practice_Name__c=nnull.Practice_Name__c
+							  where	Pnull.new_lid<>nnull.new_lid
+
+							   exec	sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							 select	@Tot_Row_Count=@Tot_Row_Count+@Row_Count
+
+						-------------------PracticeName and Phone 1 with Phone 2 Merge --------------------------------
+
+						insert into #temp_lid_merge_by_Phone
+						(
+							old_id,new_id,new_created_date,Old_created_date,By_Name
+						)
+							 select	Pnull.new_lid as old_id
+									,nnull.new_lid as new_id
+									,nnull.LastModifiedDate
+									,Pnull.LastModifiedDate
+									,'PracticeName' 
+							   from	#temp_location_master_consolidated as Pnull
+						 inner join	
+									(
+										select	*
+										from
+										(
+												 select	cons.new_lid
+														,cons.Complete_Address
+														,cons.Address_Line_1
+														,cons.City__c
+														,cons.State__c
+														,cons.ZIP_Code__c
+														,cons.Practice_Name__c
+														,'1900-01-01' as LastModifiedDate
+														,lid_CreatedDate
+														,Phone_2__c
+														,row_number() over (partition by cons.Complete_Address,cons.Practice_Name__c order by Cons.LastModifiedDate desc,cons.lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+												   from	#temp_location_master_consolidated cons
+												  where	cons.Practice_Name__c is not null
+										)a
+										where r_no=1
+									) as nnull
+								 on	Pnull.Phone_1__c=nnull.Phone_2__c
+								and Pnull.Practice_Name__c=nnull.Practice_Name__c
+							  where	Pnull.new_lid<>nnull.new_lid
+
+							   exec	sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							 select	@Tot_Row_Count=@Tot_Row_Count+@Row_Count
+
+						-------------------PracticeName and FaxNumber Merge --------------------------------
+
+						insert into #temp_lid_merge_by_Phone
+						(
+							old_id,new_id,new_created_date,Old_created_date,By_Name
+						)
+						 select	Pnull.new_lid as old_id
+								,nnull.new_lid as new_id
+								,nnull.LastModifiedDate
+								,Pnull.LastModifiedDate
+								,'PracticeName' 
+						   from	#temp_location_master_consolidated as Pnull
+						inner join	
+								(
+									select	*
+									from
+									(
+											 select	cons.new_lid
+													,cons.Complete_Address
+													,cons.Address_Line_1
+													,cons.City__c
+													,cons.State__c
+													,cons.ZIP_Code__c
+													,cons.Practice_Name__c
+													,LastModifiedDate
+													,lid_CreatedDate
+													,FaxNumber
+													,row_number() over (partition by cons.Complete_Address,cons.Practice_Name__c order by Cons.LastModifiedDate desc,cons.lid_CreatedDate desc,charts_numbers_at_loc desc,new_lid) r_no
+											   from	#temp_location_master_consolidated cons
+											  where	cons.Practice_Name__c is not null
+									)a
+									where r_no=1
+								) as nnull
+							 on	Pnull.FaxNumber=nnull.FaxNumber
+							and Pnull.Practice_Name__c=nnull.Practice_Name__c
+						  where	Pnull.new_lid<>nnull.new_lid
+
+							exec	sp_executesql @sql,N'@Row_Count int output',@Row_Count Output
+
+							select	@Tot_Row_Count=@Tot_Row_Count+@Row_Count
+
+						end
+
+						/******************************Lid Mapping Table**************************************/
+
+									if object_id('tempdb..#Temp_Lid_Tin_Mapping_Master') is not null drop table #Temp_Lid_Tin_Mapping_Master
+
+									 Select	TIN_ID__C as TIN_ID
+											,New_lid_all as New_lid
+											,Provider_Full_Address as Provider_Full_Address
+											,Address_Line_1__c as Address_Line_1
+											,Address_Line_2__c as Address_Line_2
+											,City__c as City
+											,State__c as State
+											,ZIP_Code__c as ZIP_Code
+											,sum(CountOfChartsatLoc_byTin) as CountOfChartsatLoc_byTin
+											,sum(CountOfChartsatLoc_byTinAdd) as CountOfChartsatLoc_byTinAdd
+											,sum(CountOfChartsatLoc_byAdd) as CountOfChartsatLoc_byAdd
+											,sum(RetrivalOfChartsatLoc_byTinAdd) as RetrivalOfChartsatLoc_byTinAdd
+											,sum(RetrivalOfChartsatLoc_byTin) as RetrivalOfChartsatLoc_byTin
+											,sum(RetrivalOfChartsatLoc_byAdd) as RetrivalOfChartsatLoc_byAdd
+											--cast((cast(sum(Charts_Retrival) as float)/sum(Total_Charts)) as numeric(10,2)) * 100 as Percent_of_Charts_Recovered 
+											,lid_created_date
+											,getdate() as dt_updated_date
+									   into #Temp_Lid_Tin_Mapping_Master
+									   from (
+												select	distinct 
+														Provider__c.TIN_ID__C
+														,#temp_poc_lm_sfdcLid_newLid_map.New_lid_all
+														,Replace(Provider__c.Address_Line_1__c,'@',' ')Address_Line_1__c
+														,Provider__c.Address_Line_2__c
+														,Provider__c.City__c
+														,Provider__c.State__c
+														,left(ltrim(Provider__c.ZIP_Code__c ),5) as ZIP_Code__c
+														,#temp_poc_lm_sfdcLid_newLid_map.sfdc_Lid
+														,Provider_Full_Address
+														,sum(Provider__c.Num_of_Charts__c)  
+															over(partition by provider__c.TIN_ID__c,Provider_Full_Address,#temp_poc_lm_sfdcLid_newLid_map.New_lid_all) as CountOfChartsatLoc_byTinAdd
+														,sum(Provider__c.Num_of_Charts__c) 
+															over(partition by provider__c.TIN_ID__c,#temp_poc_lm_sfdcLid_newLid_map.New_lid_all) as CountOfChartsatLoc_byTin
+														,sum(Provider__c.Num_of_Charts__c) 
+															over(partition by Provider_Full_Address,#temp_poc_lm_sfdcLid_newLid_map.New_lid_all) as CountOfChartsatLoc_byAdd
+														,sum(chart__c.Id)  
+															over(partition by provider__c.TIN_ID__c,Provider_Full_Address,#temp_poc_lm_sfdcLid_newLid_map.New_lid_all) as RetrivalOfChartsatLoc_byTinAdd
+														,sum(chart__c.Id) 
+															over(partition by provider__c.TIN_ID__c,#temp_poc_lm_sfdcLid_newLid_map.New_lid_all) as RetrivalOfChartsatLoc_byTin
+														,sum(chart__c.Id) 
+															over(partition by Provider_Full_Address,#temp_poc_lm_sfdcLid_newLid_map.New_lid_all) as RetrivalOfChartsatLoc_byAdd
+														,#temp_location_master_consolidated.LastModifiedDate as lid_created_date
+												   from	#temp_poc_lm_sfdcLid_newLid_map
+											 inner join	ProviderLocationJunction__c 
+													 on	#temp_poc_lm_sfdcLid_newLid_map.LOCATION__C = ProviderLocationJunction__c.LOCATION__C
+											 inner join	(
+															select	Provider__c.id
+																	,Num_of_Charts__c
+																	,isnull(isnull(Provider__c.TIN_ID__C,Npi.Tin_Id),CVTY.Tin_id) as TIN_ID__C
+																	,isnull(isnull(Lkup.MD_AddressLine1,Replace(Provider__c.Address_Line_1__c,'@',' ')),'') as Address_Line_1__c
+																	,isnull(isnull(Lkup.MD_AddressLine2,Provider__c.Address_Line_2__c),'') as Address_Line_2__c
+																	,isnull(isnull(Lkup.MD_City,Provider__c.City__c),'') as City__c
+																	,isnull(isnull(Lkup.MD_State,Provider__c.State__c),'') as State__c
+																	,isnull(isnull(Lkup.MD_PostalCode,left(ltrim(Provider__c.ZIP_Code__c ),5)),'') as ZIP_Code__c
+																	,isnull(isnull(Lkup.MD_AddressLine1,Replace(Provider__c.Address_Line_1__c,'@',' ')),'')
+																	+''+isnull(isnull(Lkup.MD_AddressLine2,Provider__c.Address_Line_2__c),'')
+																	+''+isnull(isnull(Lkup.MD_City,Provider__c.City__c),'')
+																	+''+isnull(isnull(Lkup.MD_State,Provider__c.State__c),'')
+																	+''+isnull(isnull(Lkup.MD_PostalCode,left(ltrim(Provider__c.ZIP_Code__c ),5)),'') as Provider_Full_Address
+															   from	Provider__c
+														  left join	dw.lkp_Standardized_Address_forAll as Lkup
+																 on	isnull(Replace(Provider__c.Address_Line_1__c,'@',' '),'')=isnull(Lkup.Address_Line_1__c,'')
+																and	isnull(Provider__c.Address_Line_2__c,'')=isnull(Lkup.Address_Line_2__c,'')
+																and	isnull(Provider__c.City__c,'')=isnull(Lkup.City__c,'')
+																and	isnull(Provider__c.State__c,'')=isnull(Lkup.State__c,'')
+																and	isnull(left(ltrim(Provider__c.ZIP_Code__c ),5),'')=isnull(Lkup.ZIP_Code__c,'')
+														  left join (
+																		 select	distinct NPI
+																				,[Tax Id Number] as Tin_Id 
+																		   from	dw.searchTool_Npi_Tin_Map
+																	)Npi
+																 on Provider__c.Npi__c=Npi.NPI
+														  left join	(
+																		 select	distinct NPI
+																				,Tin_id 
+																		   from	dw.Temp_CVTY_EXTRACTION_Apr19 CVTY
+																	 )CVTY
+																  on Provider__c.Npi__c=CVTY.NPI
+														) as Provider__c 
+													 on	ProviderLocationJunction__c.Provider__c = Provider__c.id
+											 inner join (
+															 select	Provider__c
+																	,Location__c
+																	,count(id)Id 
+															   from	chart__c c 
+															  where	c.FileBound_Disposition_Code__c = 'QAP'
+															    and	c.FileBound_Status__c = 'REL'  
+															    and	isnull(MRT_Name__c,'') <> 'Replication'
+														   group by	Provider__c,Location__c
+														)as Chart__c
+													 on #temp_poc_lm_sfdcLid_newLid_map.Location__c= Chart__c.Location__c
+													and Provider__c.Id = Chart__c.Provider__c
+											 inner join #temp_location_master_consolidated
+													 on #temp_poc_lm_sfdcLid_newLid_map.NEW_LID_ALL = #temp_location_master_consolidated.new_lid
+												 -- where 
+													--	--Provider__c.TIN_ID__C is not null
+													--	--and 
+													--Chart__c.FileBound_Disposition_Code__c = 'QAP'
+													--and Chart__c.FileBound_Status__c = 'REL'  
+													--and isnull(MRT_Name__c,'') <> 'Replication'
+													--and Provider__c.TIN_ID__C='135562308'
+
+											)a
+								   group by	TIN_ID__C
+											,Provider_Full_Address
+											,New_lid_all
+											,Address_Line_1__c
+											,Address_Line_2__c
+											,City__c
+											,State__c
+											,ZIP_Code__c
+											--,CountOfChartsatLoc_byTin
+											,lid_created_date
+
+									 
+
+							--drop table dw.Tb_LidMastering_Projectwise
+									--create table dw.Tb_LidMastering_Projectwise
+									--(
+									--	N_id numeric(18,0) identity(1,1),Project_name varchar(500),New_lid varchar(64),SFLIDs varchar(2000),Contact_Person varchar(150),Practice_Name varchar(150),
+									--	Address_Line_1 varchar(150),Address_Line_2 varchar(150),City varchar(150),State varchar(150),ZIP_Code varchar(150),Location_Latitude varchar(150),
+									--	Location_Longitude varchar(150),Phone_1 varchar(150),Phone_2 varchar(150),FaxNumber varchar(150),lid_CreatedDate datetime,LastModifiedDate datetime,
+									--	charts_numbers_at_loc int,charts_recovered_at_loc int,Percent_of_Charts_Recovered varchar(30),mostCommonRetreivalMode varchar(30),charts_retreived_via_SFTP int,
+									--	charts_retreived_via_MailRoom int,charts_retreived_via_Fax int,charts_retreived_via_eMail int,charts_retreived_via_CopyService int,
+									--	charts_retreived_via_Field int,charts_retreived_via_NullOthers int,Record_Storage_Type varchar(30),EMR_Info varchar(150),dt_inserted_date datetime
+									--)
+
+									if object_id('tempdb..#Temp_Lid_Master') is not null drop table #Temp_Lid_Master
+
+									  ;with	cte_Combine_Sflid 
+										 as (
+												 select	NEW_LID_ALL as New_lid
+														,stuff(
+														(
+																select distinct ','+sfdc_Lid
+																from	#temp_poc_lm_sfdcLid_newLid_map a
+																where	a.NEW_LID_ALL=b.NEW_LID_ALL
+																for xml path('')
+														),1,1,'') as sflid
+												   from	#temp_poc_lm_sfdcLid_newLid_map b
+											   group by	NEW_LID_ALL
+											)
+
+											 select	LM.new_lid
+													,SC.SFLID
+													,LM.Contact_Person__c
+													,LM.Practice_Name__c
+													,LM.Address_Line_1
+													,LM.Address_Line_2
+													,LM.City__c
+													,LM.State__c
+													,LM.ZIP_Code__c
+													,LM.Location__Latitude__s
+													,LM.Location__Longitude__s
+													,LM.Phone_1__c
+													,LM.Phone_2__c
+													,LM.FaxNumber
+													,LM.LastModifiedDate
+													,LM.lid_CreatedDate
+													,LM.charts_numbers_at_loc
+													,LM.charts_recovered_at_loc
+													,cast(round(100*(LM.charts_recovered_at_loc/LM.charts_numbers_at_loc), 2, 1) as decimal(18,2)) as Percent_of_Charts_Recovered__c
+													,x.highestRetreivalType as mostCommonRetreivalMode
+													,LM.charts_retreived_via_SFTP
+													,LM.charts_retreived_via_MailRoom
+													,LM.charts_retreived_via_Fax
+													,LM.charts_retreived_via_eMail
+													,LM.charts_retreived_via_CopyService
+													,LM.charts_retreived_via_Field
+													,LM.charts_retreived_via_NullOthers
+													,LM.Num_of_Calls
+													,LM.Record_Storage_Type__c
+													,LM.EMR_Info
+											   into	#Temp_Lid_Master
+											   from	#temp_location_master_consolidated LM
+										 left join cte_Combine_Sflid SC
+												 on LM.new_lid=SC.New_lid
+										cross apply (
+														 select	top 1 new_lid highestRetreivalType
+														   from	(
+																	values ('SFTP'       , charts_retreived_via_SFTP)
+																	,('MailRoom'   , charts_retreived_via_MailRoom)
+																	,('Fax'        , charts_retreived_via_Fax)
+																	,('eMail'      , charts_retreived_via_eMail)
+																	,('CopyService', charts_retreived_via_CopyService)
+																	,('Field'      , charts_retreived_via_Field)
+																	,('NullOthers' , charts_retreived_via_NullOthers)              
+																) x(new_lid, value)
+													   order by	value desc
+													) x
+
+					Begin Transaction
+
+						Begin Try
+
+									update	tgt
+										set CountOfChartsatLoc_byAdd=tgt.CountOfChartsatLoc_byAdd+bse.CountOfChartsatLoc_byAdd
+											,CountOfChartsatLoc_byTin=tgt.CountOfChartsatLoc_byTin+bse.CountOfChartsatLoc_byTin
+											,CountOfChartsatLoc_byTinAdd=tgt.CountOfChartsatLoc_byTinAdd+bse.CountOfChartsatLoc_byTinAdd
+											,RetrivalOfChartsatLoc_byAdd=tgt.RetrivalOfChartsatLoc_byAdd+bse.RetrivalOfChartsatLoc_byAdd
+											,RetrivalOfChartsatLoc_byTin=tgt.RetrivalOfChartsatLoc_byTin+bse.RetrivalOfChartsatLoc_byTin
+											,RetrivalOfChartsatLoc_byTinAdd=tgt.RetrivalOfChartsatLoc_byTinAdd+bse.RetrivalOfChartsatLoc_byTinAdd
+											,PercentOfChartsatLoc_byAdd=cast(cast(tgt.RetrivalOfChartsatLoc_byAdd+bse.RetrivalOfChartsatLoc_byAdd as float)/tgt.CountOfChartsatLoc_byAdd+bse.CountOfChartsatLoc_byAdd as decimal(10,2))*100 
+											,PercentOfChartsatLoc_byTin=cast(cast(tgt.RetrivalOfChartsatLoc_byTin+bse.RetrivalOfChartsatLoc_byTin  as float)/tgt.CountOfChartsatLoc_byTin+bse.CountOfChartsatLoc_byTin as decimal(10,2))*100 
+											,PercentOfChartsatLoc_byTinAdd=cast(cast(tgt.RetrivalOfChartsatLoc_byTinAdd+bse.RetrivalOfChartsatLoc_byTinAdd as float)/tgt.CountOfChartsatLoc_byTinAdd+bse.CountOfChartsatLoc_byTinAdd as decimal(10,2))*100
+											,dt_updated_date=getdate()
+									   from	dw.Tb_LidMastering_TinMappingMaster tgt
+								 inner join	#Temp_Lid_Tin_Mapping_Master bse 
+										 on	tgt.TIN_ID=bse.TIN_ID 
+										and tgt.New_lid=bse.New_lid 
+										and tgt.Provider_Full_Address=bse.Provider_Full_Address
+
+									insert into dw.Tb_LidMastering_TinMappingMaster
+									(
+										TIN_ID,New_lid,Provider_Full_Address,Address_line_1,Address_line_2,City,State,Zip_Code,CountOfChartsatLoc_byTin,CountOfChartsatLoc_byTinAdd,
+										CountOfChartsatLoc_byAdd,RetrivalOfChartsatLoc_byAdd,RetrivalOfChartsatLoc_byTin,RetrivalOfChartsatLoc_byTinAdd,PercentOfChartsatLoc_byAdd,
+										PercentOfChartsatLoc_byTin,PercentOfChartsatLoc_byTinAdd,lid_created_date,dt_updated_date
+									) 
+									 select	tgt.TIN_ID
+											,tgt.New_lid
+											,tgt.Provider_Full_Address
+											,tgt.Address_line_1
+											,tgt.Address_line_2
+											,tgt.City
+											,tgt.State
+											,tgt.Zip_Code
+											,tgt.CountOfChartsatLoc_byTin
+											,tgt.CountOfChartsatLoc_byTinAdd
+											,tgt.CountOfChartsatLoc_byAdd
+											,tgt.RetrivalOfChartsatLoc_byAdd
+											,tgt.RetrivalOfChartsatLoc_byTin
+											,tgt.RetrivalOfChartsatLoc_byTinAdd
+											,cast(cast(tgt.RetrivalOfChartsatLoc_byAdd as float)/tgt.CountOfChartsatLoc_byAdd as decimal(10,2))*100 as PercentOfChartsatLoc_byAdd
+											,cast(cast(tgt.RetrivalOfChartsatLoc_byTin as float)/tgt.CountOfChartsatLoc_byTin as decimal(10,2))*100 as PercentOfChartsatLoc_byTin
+											,cast(cast(tgt.RetrivalOfChartsatLoc_byTinAdd as float)/tgt.CountOfChartsatLoc_byTinAdd as decimal(10,2))*100 as PercentOfChartsatLoc_byTinAdd
+											,tgt.lid_created_date
+											,getdate() 
+									   from	#Temp_Lid_Tin_Mapping_Master tgt
+								  left join	dw.Tb_LidMastering_TinMappingMaster bse 
+										 on	tgt.TIN_ID=bse.TIN_ID 
+										and tgt.New_lid=bse.New_lid 
+										and tgt.Provider_Full_Address=bse.Provider_Full_Address
+									  where bse.TIN_ID is null
+
+									 delete tgt
+									   from	dw.Tb_LidMastering_TinMappingMaster tgt
+								  left join #Temp_Lid_Tin_Mapping_Master bse
+										 on	tgt.TIN_ID=bse.TIN_ID 
+										and tgt.New_lid=bse.New_lid 
+										and tgt.Provider_Full_Address=bse.Provider_Full_Address
+									  where bse.TIN_ID is null
+
+									 ;with	cte_newlid_mapping 
+										as	(
+												 select	TIN_ID,count(distinct New_lid) cnt
+												   from	dw.Tb_LidMastering_TinMappingMaster
+											   group by	TIN_ID
+											)
+
+									 update	tgt 
+										set	C_Flag=iif(bse.cnt=1,'U','S')
+									   from	dw.Tb_LidMastering_TinMappingMaster tgt
+								 inner join	cte_newlid_mapping bse 
+										 on	tgt.tin_id=bse.TIN_ID
+
+									update	tgt set 
+											SFLIDs = bse.SFLID
+											,Contact_Person = bse.Contact_Person__c
+											,Practice_Name = bse.Practice_Name__c
+											,Address_Line_1 = bse.Address_Line_1
+											,Address_Line_2 = bse.Address_Line_2
+											,City = bse.City__c
+											,State = bse.State__c
+											,ZIP_Code = bse.ZIP_Code__c
+											,Location_Latitude = bse.Location__Latitude__s 
+											,Location_Longitude = bse.Location__Latitude__s
+											,Phone_1 = bse.Phone_1__c
+											,Phone_2 = bse.Phone_2__c
+											,FaxNumber = bse.FaxNumber
+											,lid_CreatedDate = bse.LastModifiedDate
+											,charts_numbers_at_loc = bse.charts_numbers_at_loc
+											,charts_recovered_at_loc = bse.charts_recovered_at_loc
+											,Percent_of_Charts_Recovered = cast(round(100*(bse.charts_recovered_at_loc/bse.charts_numbers_at_loc), 2, 1) as decimal(18,2))
+											,mostCommonRetreivalMode = bse.mostCommonRetreivalMode
+											,charts_retreived_via_SFTP = bse.charts_retreived_via_SFTP
+											,charts_retreived_via_MailRoom = bse.charts_retreived_via_MailRoom 
+											,charts_retreived_via_Fax = bse.charts_retreived_via_Fax
+											,charts_retreived_via_eMail = bse.charts_retreived_via_eMail
+											,charts_retreived_via_CopyService = bse.charts_retreived_via_CopyService
+											,charts_retreived_via_Field = bse.charts_retreived_via_Field
+											,charts_retreived_via_NullOthers = bse.charts_retreived_via_NullOthers
+											,Num_of_Calls = bse.Num_of_Calls
+											,Record_Storage_Type = bse.Record_Storage_Type__c
+											,EMR_Info = bse.EMR_Info
+											,dt_updated_date=getdate()
+									   from	dw.Tb_LidMastering_LocationMaster tgt
+								 inner join	#Temp_Lid_Master bse 
+										 on	tgt.new_lid = bse.new_lid
+
+								 --truncate table dw.Tb_LidMastering_LocationMaster
+							insert into dw.Tb_LidMastering_LocationMaster
+							(
+								New_lid,SFLIDs,Contact_Person,Practice_Name,Address_Line_1,Address_Line_2,City,State,ZIP_Code
+								,Location_Latitude,Location_Longitude,Phone_1,Phone_2,FaxNumber,lid_CreatedDate,LastModifiedDate,charts_numbers_at_loc
+								,charts_recovered_at_loc,Percent_of_Charts_Recovered,mostCommonRetreivalMode,charts_retreived_via_SFTP
+								,charts_retreived_via_MailRoom,charts_retreived_via_Fax,charts_retreived_via_eMail,charts_retreived_via_CopyService
+								,charts_retreived_via_Field,charts_retreived_via_NullOthers,Num_of_Calls,Record_Storage_Type,EMR_Info,dt_updated_date
+							)
+							 select	tgt.New_lid
+									,tgt.SFLID
+									,tgt.Contact_Person__c
+									,tgt.Practice_Name__c
+									,tgt.Address_Line_1
+									,tgt.Address_Line_2
+									,tgt.City__c
+									,tgt.State__c
+									,tgt.ZIP_Code__c
+									,tgt.Location__Latitude__s
+									,tgt.Location__Longitude__s
+									,tgt.Phone_1__c
+									,tgt.Phone_2__c
+									,tgt.FaxNumber
+									,tgt.lid_CreatedDate
+									,tgt.LastModifiedDate
+									,tgt.charts_numbers_at_loc
+									,tgt.charts_recovered_at_loc
+									,tgt.Percent_of_Charts_Recovered__c
+									,tgt.mostCommonRetreivalMode
+									,tgt.charts_retreived_via_SFTP
+									,tgt.charts_retreived_via_MailRoom
+									,tgt.charts_retreived_via_Fax
+									,tgt.charts_retreived_via_eMail
+									,tgt.charts_retreived_via_CopyService
+									,tgt.charts_retreived_via_Field
+									,tgt.charts_retreived_via_NullOthers
+									,tgt.Num_of_Calls
+									,tgt.Record_Storage_Type__c
+									,tgt.EMR_Info
+									,getdate()
+							   from	#Temp_Lid_Master tgt
+						  left join dw.Tb_LidMastering_LocationMaster bse 
+								 on tgt.New_lid=bse.new_lid
+							  where bse.new_lid is null
+
+
+							  insert into dw.Tb_LidMastering_LocationMaster_Log
+							  (
+									N_id,New_lid,SFLIDs,Contact_Person,Practice_Name,Address_Line_1,Address_Line_2,City,State,ZIP_Code,Location_Latitude,Location_Longitude,
+									Phone_1,Phone_2,FaxNumber,lid_CreatedDate,LastModifiedDate,charts_numbers_at_loc,charts_recovered_at_loc,Percent_of_Charts_Recovered,
+									mostCommonRetreivalMode,charts_retreived_via_SFTP,charts_retreived_via_MailRoom,charts_retreived_via_Fax,charts_retreived_via_eMail,
+									charts_retreived_via_CopyService,charts_retreived_via_Field,charts_retreived_via_NullOthers,Num_of_Calls,Record_Storage_Type,EMR_Info,dt_updated_date,
+									vc_Remarks,dt_inserted_date
+							  )
+							  select tgt.N_id
+									,tgt.New_lid
+									,tgt.SFLIDs,Contact_Person
+									,tgt.Practice_Name
+									,tgt.Address_Line_1
+									,tgt.Address_Line_2
+									,tgt.City
+									,tgt.State
+									,tgt.ZIP_Code
+									,tgt.Location_Latitude
+									,tgt.Location_Longitude
+									,tgt.Phone_1
+									,tgt.Phone_2
+									,tgt.FaxNumber
+									,tgt.lid_CreatedDate
+									,tgt.LastModifiedDate
+									,tgt.charts_numbers_at_loc
+									,tgt.charts_recovered_at_loc
+									,tgt.Percent_of_Charts_Recovered
+									,tgt.mostCommonRetreivalMode
+									,tgt.charts_retreived_via_SFTP
+									,tgt.charts_retreived_via_MailRoom
+									,tgt.charts_retreived_via_Fax
+									,tgt.charts_retreived_via_eMail
+									,tgt.charts_retreived_via_CopyService
+									,tgt.charts_retreived_via_Field
+									,tgt.charts_retreived_via_NullOthers
+									,tgt.Num_of_Calls
+									,tgt.Record_Storage_Type
+									,tgt.EMR_Info
+									,tgt.dt_updated_date
+									,'Merged with new lid'
+									,getdate()
+							  from	dw.Tb_LidMastering_LocationMaster tgt
+						  left join #Temp_Lid_Master bse 
+								 on tgt.New_lid=bse.new_lid
+							  where bse.new_lid is null
+
+							 delete	tgt 
+							   from	dw.Tb_LidMastering_LocationMaster tgt
+						  left join #Temp_Lid_Master bse 
+								 on tgt.New_lid=bse.new_lid
+							  where bse.new_lid is null
+		
+					insert into dw.Tb_LidMastering_Projectwise
+					(
+						Location__c,SFDC_LID,NEW_LID_ALL,Client_Name__c,Contact_Person__c,Contact_Person_2__c,Practice_Name__c,ZIP_Code__c,MD_AddressLine1,MD_AddressLine2,MD_City,
+						MD_State,MD_PostalCode,Phone_1__c,Phone_2__c,Fax_Number__c,Fax_Number_Console__c,Fax_Number_For_Display__c,Location__Latitude__s,Location__Longitude__s,
+						Provider_Full_Address,Provider_Address_1,Provider_Address_2,Provider_City,Provider_State,Provider_ZIP_Code,Record_Storage_Type__c,EMR_System__c,
+						EMR_Version__c,Other_EMR_System__c,CreatedDate,LastModifiedDate,Num_of_Charts__c,Num_of_Charts_Scheduled__c,charts_recovered_at_loc,charts_retreived_via_SFTP,
+						charts_retreived_via_MailRoom,charts_retreived_via_Fax,charts_retreived_via_eMail,charts_retreived_via_CopyService,charts_retreived_via_Field,charts_retreived_via_NullOthers,
+						Appointment_Type__c,Workflow_Status__c,Invoices__c,PNP_Reason__c,Num_of_Calls__c,Number_of_PNP__c,Project_name,dt_inserted_date
+					)
+						select	Location__c
+								,SFDC_LID
+								,NEW_LID_ALL
+								,Client_Name__c
+								,Contact_Person__c
+								,Contact_Person_2__c
+								,Practice_Name__c
+								,ZIP_Code__c
+								,MD_AddressLine1
+								,MD_AddressLine2
+								,MD_City,MD_State
+								,MD_PostalCode
+								,Phone_1__c
+								,Phone_2__c
+								,Fax_Number__c
+								,Fax_Number_Console__c
+								,Fax_Number_For_Display__c
+								,Location__Latitude__s
+								,Location__Longitude__s
+								,Provider_Full_Address
+								,Provider_Address_1
+								,Provider_Address_2
+								,Provider_City
+								,Provider_State
+								,Provider_ZIP_Code
+								,Record_Storage_Type__c
+								,EMR_System__c
+								,EMR_Version__c
+								,Other_EMR_System__c
+								,CreatedDate
+								,LastModifiedDate
+								,Num_of_Charts__c
+								,Num_of_Charts_Scheduled__c
+								,charts_recovered_at_loc
+								,charts_retreived_via_SFTP
+								,charts_retreived_via_MailRoom
+								,charts_retreived_via_Fax
+								,charts_retreived_via_eMail
+								,charts_retreived_via_CopyService
+								,charts_retreived_via_Field
+								,charts_retreived_via_NullOthers
+								,Appointment_Type__c
+								,Workflow_Status__c
+								,Invoices__c
+								,PNP_Reason__c
+								,Num_of_Calls__c
+								,Number_of_PNP__c
+								,@Project_name
+								,Getdate()
+						   from	#temp_poc_location_master_hash_gen
+
+						--Delete_Block:
+						--begin
+
+						----		--select	#temp_poc_lm_sfdcLid_newLid_map.New_lid_all
+						----		--						,Provider__c.Address_Line_1__c
+						----		--						,Provider__c.Address_Line_2__c
+						----		--						,Provider__c.City__c
+						----		--						,Provider__c.State__c
+						----		--						,Provider__c.ZIP_Code__c
+						----		--						,#temp_poc_lm_sfdcLid_newLid_map.sfdc_Lid
+						----		--						,Provider_Full_Address
+						----		--						,count(chart__c.id)  
+						----		--							over(partition by provider__c.TIN_ID__c,Provider_Full_Address) as CountOfChartsatLoc_byTinAdd
+						----		--						,count(chart__c.id) over(partition by provider__c.TIN_ID__c) as CountOfChartsatLoc_byTin
+						----		--						,count(chart__c.id) 
+						----		--							over(partition by Provider_Full_Address) as CountOfChartsatLoc_byAdd
+						----		--						,#temp_location_master_consolidated.LastModifiedDate as lid_created_date
+						----		--				   from	#temp_poc_lm_sfdcLid_newLid_map
+						----		--			 inner join	ProviderLocationJunction__c 
+						----		--					 on	#temp_poc_lm_sfdcLid_newLid_map.LOCATION__C = ProviderLocationJunction__c.LOCATION__C
+						----		--			 inner join	(
+						----		--							select	Provider__c.id
+						----		--									,Provider__c.TIN_ID__C
+						----		--									,isnull(isnull(Lkup.MD_AddressLine1,Provider__c.Address_Line_1__c),'') as Address_Line_1__c
+						----		--									,isnull(isnull(Lkup.MD_AddressLine2,Provider__c.Address_Line_2__c),'') as Address_Line_2__c
+						----		--									,isnull(isnull(Lkup.MD_City,Provider__c.City__c),'') as City__c
+						----		--									,isnull(isnull(Lkup.MD_State,Provider__c.State__c),'') as State__c
+						----		--									,isnull(isnull(Lkup.MD_PostalCode,Provider__c.ZIP_Code__c),'') as ZIP_Code__c
+						----		--									,isnull(isnull(Lkup.MD_AddressLine1,Provider__c.Address_Line_1__c),'')
+						----		--									+''+isnull(isnull(Lkup.MD_AddressLine2,Provider__c.Address_Line_2__c),'')
+						----		--									+''+isnull(isnull(Lkup.MD_City,Provider__c.City__c),'')
+						----		--									+''+isnull(isnull(Lkup.MD_State,Provider__c.State__c),'')
+						----		--									+''+isnull(isnull(Lkup.MD_PostalCode,Provider__c.ZIP_Code__c),'') as Provider_Full_Address
+						----		--							   from	Provider__c 
+						----		--						  left join	dw.lkp_Standardized_Address_forAll as Lkup
+						----		--								 on	isnull(Provider__c.Address_Line_1__c,'')=isnull(Lkup.Address_Line_1__c,'')
+						----		--								and	isnull(Provider__c.Address_Line_2__c,'')=isnull(Lkup.Address_Line_2__c,'')
+						----		--								and	isnull(Provider__c.City__c,'')=isnull(Lkup.City__c,'')
+						----		--								and	isnull(Provider__c.City__c,'')=isnull(Lkup.City__c,'')
+						----		--								and	isnull(Provider__c.State__c,'')=isnull(Lkup.State__c,'')
+						----		--								and	isnull(Provider__c.ZIP_Code__c,'')=isnull(Lkup.ZIP_Code__c,'')
+						----		--						) as Provider__c 
+						----		--					 on	ProviderLocationJunction__c.Provider__c = Provider__c.id
+						----		--			 inner join Chart__c
+						----		--					 on #temp_poc_lm_sfdcLid_newLid_map.Location__c= Chart__c.Location__c
+						----		--					and Provider__c.Id = Chart__c.Provider__c
+						----		--			 inner join #temp_location_master_consolidated
+						----		--					 on #temp_poc_lm_sfdcLid_newLid_map.NEW_LID_ALL = #temp_location_master_consolidated.new_lid
+						----		--				  where Provider__c.TIN_ID__C is not null
+						----		--					and Chart__c.FileBound_Disposition_Code__c = 'QAP'
+						----		--					and Chart__c.FileBound_Status__c = 'REL'  
+						----		--					and isnull(MRT_Name__c,'') <> 'Replication'
+
+						----		-- select	Location2__c.Name
+						----		--   from	dw.Tb_LidMastering_Projectwise 
+						----	 --inner join	#temp_provider_loc_reference
+						----		--	 on	dw.Tb_LidMastering_Projectwise
+						----	 --inner join	Location2__c 
+						----		--	 on	#temp_provider_loc_reference.location__c = Location2__c.Id
+
+
+						----		set @Vc_Remarks='Delete Request'
+						--SELECT 1
+
+						--end
+
+						COMMIT TRANSACTION 
+
+					End Try
+
+
+					Begin Catch
+
+						Rollback Transaction
+
+						Set @Vc_Error_Desc='Transaction Error:'+ERROR_MESSAGE()+';Error Line:'+''+Cast(ERROR_LINE() as varchar(30))
+
+					End Catch 
+					
+		End Try
+
+		Begin Catch
+			
+					Set @Vc_Error_Desc='Sub Procedure Error:'+ERROR_MESSAGE()+';Error Line:'+''+Cast(ERROR_LINE() as varchar(30))
+
+		End Catch
+
+		select	@I_Lid_Count=count(1) 
+			,@Vc_Remarks='Add Request'
+		from	#temp_poc_location_master_hash_gen
+		
+		Drop table #temp_provider_loc_reference
+		Drop table #temp_rel_qap_data
+		Drop table #temp_RelQap_Data
+		Drop table #temp_lidPrep_LidData_LkpStandardized
+		Drop table #temp_poc_location_master_hash_gen
+		Drop table #temp_lid_merge_by_Phone
+		Drop table #Temp_Lid_Tin_Mapping_Master
+		Drop table #Temp_Lid_Master
+		Drop table #temp_poc_lm_sfdcLid_newLid_map
+		Drop table #temp_poc_lm_locations_master_latest
+		Drop table #Temp_Location_Address_Project_wise
+
+End
